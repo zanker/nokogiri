@@ -4,10 +4,27 @@ VALUE cNokogiriXmlSaxParserContext ;
 
 static ID id_read;
 
+/* The input is parsed long after the context is created, so it has to be kept alive; and when it is
+ * an IO, libxml2 calls back into it through the address handed to xmlCreateIOParserCtxt, so it also
+ * has to stay put. Holding it here and marking it in xml_sax_parser_context_type_mark does both. */
+typedef struct {
+  xmlParserCtxtPtr ctxt;
+  VALUE rb_input;
+} nokogiriSaxParserContextTuple;
+
+static void
+xml_sax_parser_context_type_mark(void *data)
+{
+  nokogiriSaxParserContextTuple *tuple = data;
+  rb_gc_mark(tuple->rb_input); /* pinning, deliberately: libxml2 holds this object's address */
+}
+
 static void
 xml_sax_parser_context_type_free(void *data)
 {
-  xmlParserCtxtPtr ctxt = data;
+  nokogiriSaxParserContextTuple *tuple = data;
+  xmlParserCtxtPtr ctxt = tuple->ctxt;
+
   ctxt->sax = NULL;
   if (ctxt->myDoc) {
     xmlFreeDoc(ctxt->myDoc);
@@ -15,6 +32,7 @@ xml_sax_parser_context_type_free(void *data)
   if (ctxt) {
     xmlFreeParserCtxt(ctxt);
   }
+  ruby_xfree(tuple);
 }
 
 /*
@@ -24,6 +42,7 @@ xml_sax_parser_context_type_free(void *data)
 static const rb_data_type_t xml_sax_parser_context_type = {
   .wrap_struct_name = "xmlParserCtxt",
   .function = {
+    .dmark = xml_sax_parser_context_type_mark,
     .dfree = xml_sax_parser_context_type_free,
   },
   .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED,
@@ -32,15 +51,29 @@ static const rb_data_type_t xml_sax_parser_context_type = {
 xmlParserCtxtPtr
 noko_xml_sax_parser_context_unwrap(VALUE rb_context)
 {
-  xmlParserCtxtPtr c_context;
-  TypedData_Get_Struct(rb_context, xmlParserCtxt, &xml_sax_parser_context_type, c_context);
-  return c_context;
+  nokogiriSaxParserContextTuple *tuple;
+  TypedData_Get_Struct(rb_context, nokogiriSaxParserContextTuple, &xml_sax_parser_context_type, tuple);
+  return tuple->ctxt;
 }
 
 VALUE
 noko_xml_sax_parser_context_wrap(VALUE klass, xmlParserCtxtPtr c_context)
 {
-  return TypedData_Wrap_Struct(klass, &xml_sax_parser_context_type, c_context);
+  nokogiriSaxParserContextTuple *tuple;
+  VALUE rb_context = TypedData_Make_Struct(klass, nokogiriSaxParserContextTuple, &xml_sax_parser_context_type, tuple);
+
+  tuple->ctxt = c_context;
+  tuple->rb_input = Qnil;
+
+  return rb_context;
+}
+
+static void
+xml_sax_parser_context_set_input(VALUE rb_context, VALUE rb_input)
+{
+  nokogiriSaxParserContextTuple *tuple;
+  TypedData_Get_Struct(rb_context, nokogiriSaxParserContextTuple, &xml_sax_parser_context_type, tuple);
+  RB_OBJ_WRITE(rb_context, &tuple->rb_input, rb_input);
 }
 
 void
@@ -103,7 +136,7 @@ noko_xml_sax_parser_context_s_native_io(VALUE rb_class, VALUE rb_io, VALUE rb_en
   }
 
   VALUE rb_context = noko_xml_sax_parser_context_wrap(rb_class, c_context);
-  rb_iv_set(rb_context, "@input", rb_io);
+  xml_sax_parser_context_set_input(rb_context, rb_io);
 
   return rb_context;
 }
@@ -158,7 +191,7 @@ noko_xml_sax_parser_context_s_native_memory(VALUE rb_class, VALUE rb_input, VALU
   }
 
   VALUE rb_context = noko_xml_sax_parser_context_wrap(rb_class, c_context);
-  rb_iv_set(rb_context, "@input", rb_input);
+  xml_sax_parser_context_set_input(rb_context, rb_input);
 
   return rb_context;
 }

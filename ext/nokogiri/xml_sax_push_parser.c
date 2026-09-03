@@ -14,10 +14,24 @@ xml_sax_push_parser_free(void *data)
   }
 }
 
+/* The SAX parser's VALUE is stored in the context's `_private` by initialize_native and read back by
+ * every callback in xml_sax_parser.c. The PushParser's @sax_parser ivar keeps it alive but not in
+ * place, so the copy libxml2 holds has to be updated when it moves. */
+static void
+xml_sax_push_parser_update_references(void *data)
+{
+  xmlParserCtxtPtr ctx = data;
+
+  if (ctx->_private) {
+    ctx->_private = (void *)rb_gc_location((VALUE)ctx->_private);
+  }
+}
+
 static const rb_data_type_t xml_sax_push_parser_type = {
   .wrap_struct_name = "xmlParserCtxt",
   .function = {
     .dfree = xml_sax_push_parser_free,
+    .dcompact = xml_sax_push_parser_update_references,
   },
   .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED,
 };

@@ -18,11 +18,25 @@ dealloc(void *data)
   ruby_xfree(wrapper);
 }
 
+/* Nokogiri_wrap_xslt_stylesheet stores this object's own VALUE in the libxslt stylesheet's
+ * `_private`, and initFunc reads it back on every transform, so that copy has to be updated when the
+ * object moves -- the same treatment xmlNode and xmlNamespace already give their `_private`. */
+static void
+update_references(void *data)
+{
+  nokogiriXsltStylesheetTuple *wrapper = (nokogiriXsltStylesheetTuple *)data;
+
+  if (wrapper->ss && wrapper->ss->_private) {
+    wrapper->ss->_private = (void *)rb_gc_location((VALUE)wrapper->ss->_private);
+  }
+}
+
 static const rb_data_type_t nokogiri_xslt_stylesheet_tuple_type = {
   .wrap_struct_name = "nokogiriXsltStylesheetTuple",
   .function = {
     .dmark = mark,
     .dfree = dealloc,
+    .dcompact = update_references,
   },
   .flags = RUBY_TYPED_FREE_IMMEDIATELY
 };
@@ -137,11 +151,9 @@ rb_xslt_stylesheet_serialize(VALUE self, VALUE xmlobj)
 /*
  * Build the C-string params array passed to xsltApplyStylesheet.
  *
- * Note: params[j] is a raw pointer into a Ruby string's buffer, and we do not pin the underlying
- * VALUEs against GC compaction. This is safe (despite not pinning the VALUEs) because libxslt fully
- * processes params (interning names, evaluating values) before template execution begins, and Ruby
- * callbacks can only run during template execution. By the time GC compaction is reachable, libxslt
- * no longer reads params[].
+ * The bytes are copied rather than pointed at: StringValueCStr runs arbitrary Ruby (#to_str on a
+ * non-String, or a reallocation to null-terminate), which may collect or relocate the strings
+ * converted on earlier iterations, as may anything that allocates before xsltApplyStylesheet.
  */
 typedef struct {
   VALUE rb_param;
@@ -156,10 +168,19 @@ build_xslt_params(VALUE args_ptr)
 
   for (long j = 0; j < args->param_len; j++) {
     VALUE entry = rb_ary_entry(args->rb_param, j);
-    args->params[j] = StringValueCStr(entry);
+    args->params[j] = ruby_strdup(StringValueCStr(entry));
   }
 
   return Qnil;
+}
+
+static void
+free_xslt_params(const char **params, long param_len)
+{
+  for (long j = 0; j < param_len; j++) {
+    ruby_xfree(DISCARD_CONST_QUAL(char *, params[j]));
+  }
+  ruby_xfree(params);
 }
 
 /*
@@ -314,7 +335,7 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
 
     rb_protect(build_xslt_params, (VALUE)&args, &state);
     if (state) {
-      ruby_xfree(params);
+      free_xslt_params(params, param_len);
       rb_jump_tag(state);
     }
   }
@@ -335,7 +356,7 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
 
   c_result_document = xsltApplyStylesheet(wrapper->ss, c_document, params);
 
-  ruby_xfree(params);
+  free_xslt_params(params, param_len);
   if (defensive_copy_p) {
     xmlFreeDoc(c_document);
     c_document = NULL;
