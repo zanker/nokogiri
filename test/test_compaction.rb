@@ -7,6 +7,139 @@ describe "compaction" do
     !GC.respond_to?(:verify_compaction_references)
   end
 
+  [:nodes, :namespaces].product([false, true]).each do |result_type, return_array|
+    describe "callback #{result_type} as #{return_array ? "arrays" : "node sets"}" do
+      let(:function_class) do
+        require "weakref"
+        compact = method(:gc_verify_compaction_references)
+        selector = (result_type == :namespaces) ? "/other/namespace::*" : "/other/child"
+        Class.new do
+          define_method(:fresh) do
+            document = Nokogiri::XML('<other xmlns:kept="urn:kept"><child>retained</child></other>')
+            @document = WeakRef.new(document)
+            nodes = document.xpath(selector)
+            return_array ? nodes.to_a : nodes
+          end
+
+          def empty
+            Nokogiri::XML("<empty/>").xpath("missing")
+          end
+
+          define_method(:verify) do
+            compact.call
+            raise "GC stress was not restored" if !GC.stress
+            raise "callback result document was collected" if !@document.weakref_alive?
+
+            true
+          end
+        end
+      end
+
+      it "keeps returned XPath nodes alive until evaluation finishes" do
+        skip if skip_compaction_tests
+
+        handler = function_class.new
+        document = Nokogiri::XML("<root/>")
+        expression = "(nokogiri:fresh() | nokogiri:empty() | nokogiri:empty())[nokogiri:verify()]"
+        expression += "/parent::node()" if result_type == :namespaces
+        previous_auto_compact = GC.auto_compact
+        begin
+          GC.auto_compact = true
+          result = stress_memory_while { document.xpath(expression, handler) }
+          assert_equal([(result_type == :namespaces) ? "other" : "child"], result.map(&:name))
+          assert_equal("retained", result.text)
+        ensure
+          GC.auto_compact = previous_auto_compact
+        end
+      end
+
+      it "keeps returned XSLT nodes alive until the transform finishes" do
+        skip if skip_compaction_tests
+
+        expression = "(ext:fresh() | ext:empty() | ext:empty())[ext:verify()]"
+        expression += "/parent::node()" if result_type == :namespaces
+        stylesheet = Nokogiri::XSLT(<<~XML, "urn:retained-results" => function_class)
+          <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                          xmlns:ext="urn:retained-results" extension-element-prefixes="ext">
+            <xsl:template match="/">
+              <out><xsl:copy-of select="#{expression}"/></out>
+            </xsl:template>
+          </xsl:stylesheet>
+        XML
+        document = Nokogiri::XML("<root/>")
+        previous_auto_compact = GC.auto_compact
+        begin
+          GC.auto_compact = true
+          result = stress_memory_while { stylesheet.transform(document) }
+          assert_equal([(result_type == :namespaces) ? "other" : "child"], result.root.element_children.map(&:name))
+          assert_equal("retained", result.root.content)
+        ensure
+          GC.auto_compact = previous_auto_compact
+        end
+      end
+    end
+  end
+
+  describe Nokogiri::XML::XPathContext do
+    it "pins arguments in heap-allocated callback buffers" do
+      skip if skip_compaction_tests
+
+      compact = method(:gc_verify_compaction_references)
+      handler = Object.new
+      handler.define_singleton_method(:join) do |*values|
+        compact.call
+        values.join
+      end
+      arguments = Array.new(200) { |i| "value#{i}" }
+      expression = "nokogiri:join(#{arguments.map { |value| "'#{value}'" }.join(",")})"
+
+      assert_equal(arguments.join, Nokogiri::XML("<root/>").xpath(expression, handler))
+    end
+  end
+
+  [Nokogiri::XML::SAX, Nokogiri::HTML4::SAX].each do |sax|
+    describe sax::ParserContext do
+      it "pins the parser while callbacks compact the heap" do
+        skip if skip_compaction_tests
+
+        compact = method(:gc_verify_compaction_references)
+        names = []
+        handler = Class.new(Nokogiri::XML::SAX::Document) do
+          define_method(:start_element) do |name, _attributes = []|
+            names << name
+            compact.call
+          end
+        end.new
+        context = sax::ParserContext.memory("<html><body><p>one</p><p>two</p></body></html>")
+        context.parse_with(sax::Parser.new(handler))
+
+        assert_equal(["html", "body", "p", "p"], names)
+      end
+    end
+  end
+
+  if Nokogiri.uses_gumbo?
+    describe Nokogiri::HTML5::DocumentFragment do
+      it "retains temporary context names and encodings across compaction" do
+        skip if skip_compaction_tests
+
+        compact = method(:gc_verify_compaction_references)
+        document = Nokogiri::HTML5('<math><annotation-xml encoding="text/html"/></math>')
+        context = document.at_css("annotation-xml")
+        context.define_singleton_method(:name) { +"annotation-xml" }
+        context.define_singleton_method(:[]) { |_key| +"text/html" }
+        document.define_singleton_method(:internal_subset) do
+          compact.call
+          nil
+        end
+
+        fragment = Nokogiri::HTML5::DocumentFragment.new(document, "<a>ok</a>", context)
+        assert_equal("<a>ok</a>", fragment.to_html)
+        assert_nil(fragment.children.first.namespace)
+      end
+    end
+  end
+
   describe Nokogiri::XML::Node do
     it "compacts safely" do # https://github.com/sparklemotion/nokogiri/pull/2579
       skip if skip_compaction_tests
@@ -24,6 +157,22 @@ describe "compaction" do
         # access the node wrappers and make sure they didn't move
         doc.root.children.each(&:inspect)
       end
+    end
+  end
+
+  describe Nokogiri::XML::Document do
+    it "retains inclusive namespaces while canonicalization callbacks compact" do
+      skip if skip_compaction_tests
+
+      namespace = Object.new
+      namespace.define_singleton_method(:to_str) { +"kept" }
+      doc = Nokogiri::XML('<doc xmlns:kept="urn:kept"><child/></doc>')
+      output = doc.canonicalize(Nokogiri::XML::XML_C14N_EXCLUSIVE_1_0, [namespace]) do
+        gc_verify_compaction_references
+        true
+      end
+
+      assert_equal('<doc xmlns:kept="urn:kept"><child></child></doc>', output)
     end
   end
 
@@ -154,6 +303,39 @@ describe "compaction" do
 
   describe Nokogiri::XSLT::Stylesheet do
     let(:document) { Nokogiri::XML("<root><employee>Jane</employee></root>") }
+
+    [false, true].each do |nested|
+      it "keeps extension instances alive during #{nested ? "nested" : "ordinary"} transforms" do
+        skip if skip_compaction_tests
+
+        compact = method(:gc_verify_compaction_references)
+        stylesheet = nil
+        compacting_extension = Class.new do
+          define_method(:run) do
+            stylesheet.transform(Nokogiri::XML("<nested/>")) if nested
+            compact.call
+            "compacted"
+          end
+        end
+        other_extension = Class.new do
+          def run
+            "alive"
+          end
+        end
+
+        stylesheet = Nokogiri::XSLT(<<~XSL, "urn:compacting" => compacting_extension, "urn:other" => other_extension)
+          <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                          xmlns:a="urn:compacting" xmlns:b="urn:other" extension-element-prefixes="a b">
+            <xsl:template match="root">
+              <out><xsl:value-of select="a:run()"/><xsl:value-of select="b:run()"/></out>
+            </xsl:template>
+            <xsl:template match="nested"><out>inner</out></xsl:template>
+          </xsl:stylesheet>
+        XSL
+
+        assert_equal("compactedalive", stylesheet.transform(document).root.text)
+      end
+    end
 
     it "transforms after compaction" do # https://github.com/sparklemotion/nokogiri/pull/3667
       skip if skip_compaction_tests

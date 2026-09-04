@@ -186,29 +186,29 @@ noko_xml_xpath_context_register_variable(VALUE rb_context, VALUE name, VALUE val
 }
 
 
-/*
- *  convert an XPath object into a Ruby object of the appropriate type.
- *  returns Qundef if no conversion was possible.
- */
-static VALUE
-_noko_xml_xpath_context__xpath2ruby(xmlXPathObjectPtr c_xpath_object, xmlXPathContextPtr c_context)
-{
-  VALUE rb_retval;
+typedef struct {
+  xmlXPathObjectPtr xpath_object;
+  xmlXPathContextPtr context;
+  xmlChar *string;
+  int string_fallback;
+} xpath2ruby_args;
 
-  assert(c_context->doc);
-  assert(DOC_RUBY_OBJECT_TEST(c_context->doc));
+/* Convert an XPath object, transferring node set ownership to its Ruby wrapper. */
+static VALUE
+xpath2ruby_convert(VALUE data)
+{
+  xpath2ruby_args *args = (xpath2ruby_args *)data;
+  xmlXPathObjectPtr c_xpath_object = args->xpath_object;
 
   switch (c_xpath_object->type) {
     case XPATH_STRING:
-      rb_retval = NOKOGIRI_STR_NEW2(c_xpath_object->stringval);
-      xmlFree(c_xpath_object->stringval);
-      return rb_retval;
+      return NOKOGIRI_STR_NEW2(c_xpath_object->stringval);
 
-    case XPATH_NODESET:
-      return noko_xml_node_set_wrap(
-               c_xpath_object->nodesetval,
-               DOC_RUBY_OBJECT(c_context->doc)
-             );
+    case XPATH_NODESET: {
+      xmlNodeSetPtr node_set = c_xpath_object->nodesetval;
+      c_xpath_object->nodesetval = NULL;
+      return noko_xml_node_set_wrap(node_set, DOC_RUBY_OBJECT(args->context->doc));
+    }
 
     case XPATH_NUMBER:
       return rb_float_new(c_xpath_object->floatval);
@@ -217,8 +217,32 @@ _noko_xml_xpath_context__xpath2ruby(xmlXPathObjectPtr c_xpath_object, xmlXPathCo
       return (c_xpath_object->boolval == 1) ? Qtrue : Qfalse;
 
     default:
-      return Qundef;
+      if (args->string_fallback) {
+        args->string = xmlXPathCastToString(c_xpath_object);
+        return NOKOGIRI_STR_NEW2(args->string);
+      }
+      return noko_xml_node_set_wrap(NULL, DOC_RUBY_OBJECT(args->context->doc));
   }
+}
+
+static VALUE
+xpath2ruby_cleanup(VALUE data)
+{
+  xpath2ruby_args *args = (xpath2ruby_args *)data;
+  xmlFree(args->string);
+  xmlXPathFreeObject(args->xpath_object);
+  return Qnil;
+}
+
+static VALUE
+_noko_xml_xpath_context__xpath2ruby(xmlXPathObjectPtr c_xpath_object, xmlXPathContextPtr c_context,
+                                    int string_fallback)
+{
+  assert(c_context->doc);
+  assert(DOC_RUBY_OBJECT_TEST(c_context->doc));
+
+  xpath2ruby_args args = { c_xpath_object, c_context, NULL, string_fallback };
+  return rb_ensure(xpath2ruby_convert, (VALUE)&args, xpath2ruby_cleanup, (VALUE)&args);
 }
 
 void
@@ -226,7 +250,8 @@ Nokogiri_marshal_xpath_funcall_and_return_values(
   xmlXPathParserContextPtr ctxt,
   int argc,
   VALUE rb_xpath_handler,
-  const char *method_name
+  const char *method_name,
+  VALUE rb_retained_nodes
 )
 {
   VALUE rb_retval;
@@ -239,15 +264,11 @@ Nokogiri_marshal_xpath_funcall_and_return_values(
   assert(ctxt->context->doc);
   assert(DOC_RUBY_OBJECT_TEST(ctxt->context->doc));
 
-  argv = ALLOCV_N(VALUE, argv_handle, argc);
+  argv = ALLOCV_N(VALUE, argv_handle, (size_t)argc);
 
   for (int j = argc - 1 ; j >= 0 ; --j) {
     c_xpath_object = valuePop(ctxt);
-    argv[j] = _noko_xml_xpath_context__xpath2ruby(c_xpath_object, ctxt->context);
-    if (argv[j] == Qundef) {
-      argv[j] = NOKOGIRI_STR_NEW2(xmlXPathCastToString(c_xpath_object));
-    }
-    xmlXPathFreeNodeSetList(c_xpath_object);
+    argv[j] = _noko_xml_xpath_context__xpath2ruby(c_xpath_object, ctxt->context, 1);
   }
 
   rb_retval = rb_funcall2(
@@ -279,57 +300,88 @@ Nokogiri_marshal_xpath_funcall_and_return_values(
     case T_ARRAY: {
       VALUE construct_args[2] = { DOC_RUBY_OBJECT(ctxt->context->doc), rb_retval };
       rb_node_set = rb_class_new_instance(2, construct_args, cNokogiriXmlNodeSet);
+      rb_ary_push(rb_retained_nodes, rb_node_set);
       c_node_set = noko_xml_node_set_unwrap(rb_node_set);
       xmlXPathReturnNodeSet(ctxt, xmlXPathNodeSetMerge(NULL, c_node_set));
     }
     break;
     case T_DATA:
       if (rb_obj_is_kind_of(rb_retval, cNokogiriXmlNodeSet)) {
+        rb_ary_push(rb_retained_nodes, rb_retval);
         c_node_set = noko_xml_node_set_unwrap(rb_retval);
-        /* Copy the node set, otherwise it will get GC'd. */
+        /* libxml2 owns the copied set; Ruby owns the nodes and their documents. */
         xmlXPathReturnNodeSet(ctxt, xmlXPathNodeSetMerge(NULL, c_node_set));
         break;
       }
     default:
       rb_raise(rb_eRuntimeError, "Invalid return type");
   }
+  RB_GC_GUARD(rb_retval);
+}
+
+typedef struct {
+  VALUE handler;
+  VALUE retained_nodes;
+  int state;
+  xmlXPathParserContextPtr ctxt;
+  int argc;
+  const xmlChar *name;
+  const xmlChar *ns_uri;
+} xpath_handler_args;
+
+static VALUE
+_noko_xml_xpath_context__handler_invoker_protected(VALUE data)
+{
+  xpath_handler_args *args = (xpath_handler_args *)data;
+  Nokogiri_marshal_xpath_funcall_and_return_values(
+    args->ctxt, args->argc, args->handler, (const char *)args->ctxt->context->function,
+    args->retained_nodes
+  );
+  return Qnil;
 }
 
 static void
 _noko_xml_xpath_context__handler_invoker(xmlXPathParserContextPtr ctxt, int argc)
 {
-  VALUE rb_xpath_handler = Qnil;
-  const char *method_name = NULL ;
+  xpath_handler_args *args = ctxt->context->userData;
 
-  assert(ctxt);
-  assert(ctxt->context);
-  assert(ctxt->context->userData);
-  assert(ctxt->context->function);
+  if (!args->state) {
+    args->ctxt = ctxt;
+    args->argc = argc;
+    rb_protect(_noko_xml_xpath_context__handler_invoker_protected, (VALUE)args, &args->state);
+  }
+  if (args->state) {
+    /* Let libxml2 unwind predicates and restore its evaluation state before the Ruby jump. */
+    ctxt->error = XPATH_EXPR_ERROR;
+  }
+}
 
-  rb_xpath_handler = (VALUE)(ctxt->context->userData);
-  method_name = (const char *)(ctxt->context->function);
+static VALUE
+_noko_xml_xpath_context_handler_lookup_protected(VALUE data)
+{
+  xpath_handler_args *args = (xpath_handler_args *)data;
+  if (rb_respond_to(args->handler, rb_intern((const char *)args->name))) {
+    if (args->ns_uri == NULL) {
+      NOKO_WARN_DEPRECATION("A custom XPath or CSS handler function named '%s' is being invoked without a namespace. Please update your query to reference this function as 'nokogiri:%s'. Invoking custom handler functions without a namespace is deprecated and will become an error in Nokogiri v1.17.0.",
+                            args->name, args->name); // TODO deprecated in v1.15.0, remove in v1.19.0
+    }
+    return Qtrue;
+  }
 
-  Nokogiri_marshal_xpath_funcall_and_return_values(
-    ctxt,
-    argc,
-    rb_xpath_handler,
-    method_name
-  );
+  return Qfalse;
 }
 
 static xmlXPathFunction
 _noko_xml_xpath_context_handler_lookup(void *data, const xmlChar *c_name, const xmlChar *c_ns_uri)
 {
-  VALUE rb_handler = (VALUE)data;
-  if (rb_respond_to(rb_handler, rb_intern((const char *)c_name))) {
-    if (c_ns_uri == NULL) {
-      NOKO_WARN_DEPRECATION("A custom XPath or CSS handler function named '%s' is being invoked without a namespace. Please update your query to reference this function as 'nokogiri:%s'. Invoking custom handler functions without a namespace is deprecated and will become an error in Nokogiri v1.17.0.",
-                            c_name, c_name); // TODO deprecated in v1.15.0, remove in v1.19.0
-    }
-    return _noko_xml_xpath_context__handler_invoker;
+  xpath_handler_args *args = data;
+  VALUE result = Qfalse;
+  if (!args->state) {
+    args->name = c_name;
+    args->ns_uri = c_ns_uri;
+    result = rb_protect(_noko_xml_xpath_context_handler_lookup_protected, (VALUE)args, &args->state);
   }
-
-  return NULL;
+  return args->state || RTEST(result) ? _noko_xml_xpath_context__handler_invoker : NULL;
 }
 
 PRINTFLIKE_DECL(2, 3)
@@ -357,6 +409,13 @@ _noko_xml_xpath_context__generic_exception_pusher(void *data, const char *msg, .
   rb_ary_push(rb_errors, rb_exception);
 }
 
+static VALUE
+noko_xml_xpath_context_evaluate_protected(VALUE data)
+{
+  xmlXPathEvalExpr((xmlXPathParserContextPtr)data);
+  return Qnil;
+}
+
 /*
  * call-seq:
  *   evaluate(search_path, handler = nil) → Object
@@ -374,8 +433,12 @@ noko_xml_xpath_context_evaluate(int argc, VALUE *argv, VALUE rb_context)
   VALUE rb_function_lookup_handler = Qnil;
   xmlChar *c_expression_str = NULL;
   VALUE rb_errors = rb_ary_new();
-  xmlXPathObjectPtr c_xpath_object;
+  xmlXPathObjectPtr c_xpath_object = NULL;
   VALUE rb_xpath_object = Qnil;
+  int state = 0;
+  libxmlStructuredErrorHandlerState handler_state;
+  xmlGenericErrorFunc previous_generic_handler = xmlGenericError;
+  void *previous_generic_context = xmlGenericErrorContext;
 
   TypedData_Get_Struct(rb_context, xmlXPathContext, &_noko_xml_xpath_context_type, c_context);
 
@@ -383,37 +446,63 @@ noko_xml_xpath_context_evaluate(int argc, VALUE *argv, VALUE rb_context)
 
   c_expression_str = (xmlChar *)StringValueCStr(rb_expression);
 
+  xmlXPathFuncLookupFunc previous_lookup = c_context->funcLookupFunc;
+  void *previous_lookup_data = c_context->funcLookupData;
+  void *previous_user_data = c_context->userData;
+  VALUE rb_retained_nodes = NIL_P(rb_function_lookup_handler) ? Qnil : rb_ary_new();
+  xpath_handler_args handler_args = { rb_function_lookup_handler, rb_retained_nodes, 0, NULL, 0, NULL, NULL };
+
   if (Qnil != rb_function_lookup_handler) {
     /* FIXME: not sure if this is the correct place to shove private data. */
-    c_context->userData = (void *)rb_function_lookup_handler;
+    c_context->userData = &handler_args;
     xmlXPathRegisterFuncLookup(
       c_context,
       _noko_xml_xpath_context_handler_lookup,
-      (void *)rb_function_lookup_handler
+      &handler_args
     );
   }
 
   /* TODO: use xmlXPathSetErrorHandler (as of 2.13.0) */
-  xmlSetStructuredErrorFunc((void *)rb_errors, noko__error_array_pusher);
+  noko__structured_error_func_save_and_set(&handler_state, (void *)rb_errors, noko__error_array_pusher);
   xmlSetGenericErrorFunc((void *)rb_errors, _noko_xml_xpath_context__generic_exception_pusher);
 
-  c_xpath_object = xmlXPathEvalExpression(c_expression_str, c_context);
+  /* Own the parser context so a Ruby callback cannot skip its cleanup. */
+  xmlResetError(&c_context->lastError);
+  xmlXPathParserContextPtr c_parser = xmlXPathNewParserContext(c_expression_str, c_context);
+  if (c_parser) {
+    rb_protect(noko_xml_xpath_context_evaluate_protected, (VALUE)c_parser, &state);
+    if (handler_args.state) {
+      state = handler_args.state;
+    }
+    if (!state && c_parser->error == XPATH_EXPRESSION_OK) {
+      if (c_parser->valueNr == 1) {
+        c_xpath_object = valuePop(c_parser);
+      } else {
+        xmlXPathErr(c_parser, XPATH_STACK_ERROR);
+      }
+    }
+    xmlXPathFreeParserContext(c_parser);
+  }
 
-  xmlSetStructuredErrorFunc(NULL, NULL);
-  xmlSetGenericErrorFunc(NULL, NULL);
+  noko__structured_error_func_restore(&handler_state);
+  xmlSetGenericErrorFunc(previous_generic_context, previous_generic_handler);
 
-  xmlXPathRegisterFuncLookup(c_context, NULL, NULL);
+  xmlXPathRegisterFuncLookup(c_context, previous_lookup, previous_lookup_data);
+  c_context->userData = previous_user_data;
+  RB_GC_GUARD(rb_expression);
+  RB_GC_GUARD(rb_function_lookup_handler);
+  RB_GC_GUARD(rb_retained_nodes);
+  if (state) {
+    rb_jump_tag(state);
+  }
 
   if (c_xpath_object == NULL) {
     rb_exc_raise(rb_ary_entry(rb_errors, 0));
   }
 
-  rb_xpath_object = _noko_xml_xpath_context__xpath2ruby(c_xpath_object, c_context);
-  if (rb_xpath_object == Qundef) {
-    rb_xpath_object = noko_xml_node_set_wrap(NULL, DOC_RUBY_OBJECT(c_context->doc));
-  }
-
-  xmlXPathFreeNodeSetList(c_xpath_object);
+  rb_xpath_object = _noko_xml_xpath_context__xpath2ruby(c_xpath_object, c_context, 0);
+  RB_GC_GUARD(rb_retained_nodes);
+  RB_GC_GUARD(rb_context);
 
   return rb_xpath_object;
 }

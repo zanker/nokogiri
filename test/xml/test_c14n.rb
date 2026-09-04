@@ -5,6 +5,49 @@ require "helper"
 module Nokogiri
   module XML
     class TestC14N < Nokogiri::TestCase
+      def test_inclusive_namespace_coercion_keeps_temporary_strings_alive
+        skip("String coercion is a CRuby API") if Nokogiri.jruby?
+
+        prefix = "prefix" + "p" * 1000
+        doc = Nokogiri.XML(%(<doc xmlns:#{prefix}="urn:kept"><child/></doc>))
+        namespaces = Array.new(10) do
+          Object.new.tap do |namespace|
+            namespace.define_singleton_method(:to_str) { "prefix" + "p" * 1000 }
+          end
+        end
+        trigger = Object.new
+        trigger.define_singleton_method(:to_str) do
+          GC.start
+          "unused"
+        end
+        namespaces << trigger
+
+        assert_includes(doc.canonicalize(XML_C14N_EXCLUSIVE_1_0, namespaces), '="urn:kept"')
+      end
+
+      def test_inclusive_namespace_is_snapshotted_before_later_coercions
+        skip("String coercion is a CRuby API") if Nokogiri.jruby?
+
+        prefix = +"kept"
+        trigger = Object.new
+        trigger.define_singleton_method(:to_str) do
+          prefix.replace("changed" * 1000)
+          "unused"
+        end
+        doc = Nokogiri.XML('<doc xmlns:kept="urn:kept"/>')
+
+        assert_includes(doc.canonicalize(XML_C14N_EXCLUSIVE_1_0, [prefix, trigger]), 'xmlns:kept="urn:kept"')
+      end
+
+      def test_block_exception_and_throw_release_native_context
+        doc = Nokogiri.XML("<doc><child/></doc>")
+        error = RuntimeError.new("expected")
+
+        assert_same(error, assert_raises(RuntimeError) { doc.canonicalize { raise error } })
+        assert_equal(:done, catch(:stop) { doc.canonicalize { throw(:stop, :done) } })
+        assert_equal("<doc><child></child></doc>", doc.canonicalize)
+      end
+
       # http://www.w3.org/TR/xml-c14n#Example-OutsideDoc
       def test_3_1
         doc = Nokogiri.XML(<<~eoxml)

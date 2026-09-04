@@ -404,6 +404,21 @@ class TestHtml5API < Nokogiri::TestCase
       describe ".parse" do
         let(:html) { Nokogiri::HTML5.parse(File.read(HTML_FILE)) }
 
+        it "keeps the native document alive when a subclass initializer raises" do
+          document = nil
+          failing_class = Class.new(Nokogiri::HTML5::Document) do
+            define_method(:initialize) do |*args|
+              super(*args)
+              document = self
+              raise "expected"
+            end
+          end
+
+          assert_raises(RuntimeError) { failing_class.parse("<p>still alive</p>") }
+          GC.start
+          assert_equal("still alive", document.at_css("p").content)
+        end
+
         it "returns an instance of the expected class" do
           doc = klass.parse(File.read(HTML_FILE))
           assert_instance_of(klass, doc)

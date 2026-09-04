@@ -33,6 +33,14 @@ Nokogiri follows [Semantic Versioning](https://semver.org/), please see the [REA
 * [CRuby] `XML::SAX::ParserContext.io` keeps parsing correctly after GC compaction relocates the IO. (#3669)
 * [CRuby] `XSLT::Stylesheet#transform` works after GC compaction relocates the stylesheet. (#3667)
 * [CRuby] `XSLT::Stylesheet#transform` no longer corrupts its params when coercing one of them allocates. (#3670)
+* [CRuby] XSLT extension instances remain alive during compaction, including nested transforms. Exceptions and nonlocal exits from extension constructors and methods release the native transform context and its Ruby instances.
+* [CRuby] XSLT extension callbacks can safely retain nodes from the defensive document copy used when stripping wrapped whitespace nodes.
+* [CRuby] Native XPath callback arguments, results, and parser contexts are released when callbacks or decorators raise or exit nonlocally.
+* [CRuby] XPath and XSLT callbacks retain returned nodes and their documents until the native operation completes, including nodes returned in arrays.
+* [CRuby] NodeSet insertion and copying preserve namespace wrappers without exposing partially initialized entries to GC. XPath namespace copies retain their parent documents.
+* [CRuby] Canonicalization retains stable namespace strings across coercion and GC, and releases its native context when the visibility block raises or exits nonlocally.
+* [CRuby] HTML5 fragment parsing retains temporary context names and encodings through parsing.
+* [CRuby] Synchronous XML and HTML4 SAX parsing pins its parser during callbacks that compact the heap.
 * [CRuby MacOS] Fixed an issue handling SIGINT during HTML5 parsing. (#3528, #3535) @stevecheckoway
 * [JRuby] Fixed multiple issues with `Node#namespace_definitions` so that it now behaves identically to CRuby. (#2543, #3460) @flavorjones
 * [JRuby] `Document#create_element` and `Node.new` no longer set the namespace to the document's default namespace. The namespace must be set explicitly with `namespace=` or by parenting the node. (#3457, #3463) @flavorjones

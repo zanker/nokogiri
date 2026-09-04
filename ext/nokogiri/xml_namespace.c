@@ -166,7 +166,21 @@ noko_xml_namespace_wrap(xmlNsPtr c_namespace, xmlDocPtr c_document)
 VALUE
 noko_xml_namespace_wrap_xpath_copy(xmlNsPtr c_namespace)
 {
-  return noko_xml_namespace_wrap(c_namespace, NULL);
+  if (c_namespace->_private) {
+    return (VALUE)c_namespace->_private;
+  }
+
+  xmlNodePtr parent = (xmlNodePtr)c_namespace->next;
+  VALUE rb_document = Qnil;
+  if (parent && parent->type != XML_NAMESPACE_DECL && parent->doc && DOC_RUBY_OBJECT_TEST(parent->doc)) {
+    rb_document = DOC_RUBY_OBJECT(parent->doc);
+  }
+
+  VALUE rb_namespace = noko_xml_namespace_wrap(c_namespace, NULL);
+  if (!NIL_P(rb_document)) {
+    rb_iv_set(rb_namespace, "@document", rb_document);
+  }
+  return rb_namespace;
 }
 
 void

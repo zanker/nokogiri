@@ -1,4 +1,6 @@
 #include <nokogiri.h>
+#include <limits.h>
+#include <stdint.h>
 
 VALUE cNokogiriXmlNodeSet ;
 
@@ -93,7 +95,18 @@ rb_xml_node_set_initialize_copy(VALUE rb_self, VALUE rb_other)
   TypedData_Get_Struct(rb_self, xmlNodeSet, &xml_node_set_type, c_self);
   TypedData_Get_Struct(rb_other, xmlNodeSet, &xml_node_set_type, c_other);
 
-  xmlXPathNodeSetMerge(c_self, c_other);
+  xmlNodePtr *nodes = NULL;
+  if (c_other->nodeNr) {
+    nodes = xmlMalloc((size_t)c_other->nodeNr * sizeof(xmlNodePtr));
+    if (!nodes) {
+      rb_memerror();
+    }
+    memcpy(nodes, c_other->nodeTab, (size_t)c_other->nodeNr * sizeof(xmlNodePtr));
+  }
+  xmlFree(c_self->nodeTab);
+  c_self->nodeTab = nodes;
+  c_self->nodeNr = c_other->nodeNr;
+  c_self->nodeMax = c_other->nodeNr;
 
   rb_document = rb_iv_get(rb_other, "@document");
   if (!NIL_P(rb_document)) {
@@ -165,7 +178,32 @@ push(VALUE rb_self, VALUE rb_node)
   TypedData_Get_Struct(rb_self, xmlNodeSet, &xml_node_set_type, c_self);
   Noko_Node_Get_Struct(rb_node, xmlNode, node);
 
-  xmlXPathNodeSetAdd(c_self, node);
+  for (int j = 0; j < c_self->nodeNr; j++) {
+    if (c_self->nodeTab[j] == node) {
+      return rb_self;
+    }
+  }
+
+  if (c_self->nodeNr == c_self->nodeMax) {
+    if (c_self->nodeMax > INT_MAX / 2) {
+      rb_memerror();
+    }
+    int capacity = c_self->nodeMax ? c_self->nodeMax * 2 : 10;
+    if ((size_t)capacity > SIZE_MAX / sizeof(xmlNodePtr)) {
+      rb_memerror();
+    }
+    xmlNodePtr *nodes = xmlRealloc(c_self->nodeTab, (size_t)capacity * sizeof(xmlNodePtr));
+    if (!nodes) {
+      rb_memerror();
+    }
+    c_self->nodeTab = nodes;
+    c_self->nodeMax = capacity;
+  }
+
+  /* Namespace wrappers own their pointers; copying them would hide unwrapped nodes from the GC. */
+  c_self->nodeTab[c_self->nodeNr] = node;
+  c_self->nodeNr++;
+  RB_GC_GUARD(rb_node);
 
   return rb_self;
 }
@@ -459,7 +497,6 @@ noko_xml_node_set_wrap(xmlNodeSetPtr c_node_set, VALUE document)
 
   if (!NIL_P(document)) {
     rb_iv_set(rb_node_set, "@document", document);
-    rb_funcall(document, decorate, 1, rb_node_set);
   }
 
   if (c_node_set) {
@@ -467,6 +504,11 @@ noko_xml_node_set_wrap(xmlNodeSetPtr c_node_set, VALUE document)
     for (j = 0 ; j < c_node_set->nodeNr ; j++) {
       noko_xml_node_wrap_node_set_result(c_node_set->nodeTab[j], rb_node_set);
     }
+  }
+
+  if (!NIL_P(document)) {
+    /* Namespace copies need Ruby owners before a decorator can raise. */
+    rb_funcall(document, decorate, 1, rb_node_set);
   }
 
   return rb_node_set ;

@@ -7,6 +7,12 @@ mark(void *data)
 {
   nokogiriXsltStylesheetTuple *wrapper = (nokogiriXsltStylesheetTuple *)data;
   rb_gc_mark(wrapper->func_instances);
+  if (RTEST(wrapper->func_instances)) {
+    /* libxslt retains each state array's address until the transform shuts down. */
+    for (long i = 0; i < RARRAY_LEN(wrapper->func_instances); i++) {
+      rb_gc_mark(rb_ary_entry(wrapper->func_instances, i));
+    }
+  }
 }
 
 static void
@@ -169,6 +175,7 @@ build_xslt_params(VALUE args_ptr)
   for (long j = 0; j < args->param_len; j++) {
     VALUE entry = rb_ary_entry(args->rb_param, j);
     args->params[j] = ruby_strdup(StringValueCStr(entry));
+    RB_GC_GUARD(entry);
   }
 
   return Qnil;
@@ -181,6 +188,17 @@ free_xslt_params(const char **params, long param_len)
     ruby_xfree(DISCARD_CONST_QUAL(char *, params[j]));
   }
   ruby_xfree(params);
+}
+
+static VALUE
+xslt_stylesheet_copy_document(VALUE rb_document)
+{
+  xmlDocPtr copy = xmlCopyDoc(noko_xml_document_unwrap(rb_document), 1);
+  RB_GC_GUARD(rb_document);
+  if (!copy) {
+    rb_memerror();
+  }
+  return noko_xml_document_wrap(0, copy);
 }
 
 /*
@@ -305,8 +323,7 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
   nokogiriXsltStylesheetTuple *wrapper;
   const char **params ;
   long param_len ;
-  int parse_error_occurred ;
-  int defensive_copy_p = 0;
+  int state = 0;
 
   rb_scan_args(argc, argv, "11", &rb_document, &rb_param);
   if (NIL_P(rb_param)) { rb_param = rb_ary_new2(0L) ; }
@@ -321,6 +338,7 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
   }
 
   Check_Type(rb_param, T_ARRAY);
+  rb_error_str = rb_str_new(0, 0);
 
   c_document = noko_xml_document_unwrap(rb_document);
   TypedData_Get_Struct(self, nokogiriXsltStylesheetTuple, &nokogiri_xslt_stylesheet_tuple_type, wrapper);
@@ -341,42 +359,70 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
   }
   params[param_len] = 0 ;
 
-  xsltTransformContextPtr c_transform_context = xsltNewTransformContext(wrapper->ss, c_document);
-  if (xsltNeedElemSpaceHandling(c_transform_context) &&
-      noko_xml_document_has_wrapped_blank_nodes_p(c_document)) {
-    // see https://github.com/sparklemotion/nokogiri/issues/2800
-    c_document = xmlCopyDoc(c_document, 1);
-    defensive_copy_p = 1;
-  }
-  xsltFreeTransformContext(c_transform_context);
-
-  rb_error_str = rb_str_new(0, 0);
+  xmlGenericErrorFunc previous_xslt_handler = xsltGenericError;
+  void *previous_xslt_context = xsltGenericErrorContext;
+  xmlGenericErrorFunc previous_xml_handler = xmlGenericError;
+  void *previous_xml_context = xmlGenericErrorContext;
   xsltSetGenericErrorFunc((void *)rb_error_str, xslt_generic_error_handler);
   xmlSetGenericErrorFunc((void *)rb_error_str, xslt_generic_error_handler);
 
-  c_result_document = xsltApplyStylesheet(wrapper->ss, c_document, params);
-
-  free_xslt_params(params, param_len);
-  if (defensive_copy_p) {
-    xmlFreeDoc(c_document);
-    c_document = NULL;
+  xsltTransformContextPtr c_transform_context = xsltNewTransformContext(wrapper->ss, c_document);
+  if (c_transform_context && !c_transform_context->_private &&
+      xsltNeedElemSpaceHandling(c_transform_context) &&
+      noko_xml_document_has_wrapped_blank_nodes_p(c_document)) {
+    // see https://github.com/sparklemotion/nokogiri/issues/2800
+    xsltFreeTransformContext(c_transform_context);
+    c_transform_context = NULL;
+    /* Extension callbacks may retain nodes from the copy after the transform finishes. */
+    rb_document = rb_protect(xslt_stylesheet_copy_document, rb_document, &state);
+    if (!state) {
+      c_document = noko_xml_document_unwrap(rb_document);
+      c_transform_context = xsltNewTransformContext(wrapper->ss, c_document);
+    }
   }
 
-  xsltSetGenericErrorFunc(NULL, NULL);
-  xmlSetGenericErrorFunc(NULL, NULL);
+  c_result_document = NULL;
+  if (c_transform_context) {
+    if (!c_transform_context->_private) {
+      c_result_document = xsltApplyStylesheetUser(wrapper->ss, c_document, params,
+                          NULL, NULL, c_transform_context);
+    }
+    state = (int)(intptr_t)c_transform_context->_private;
+    xsltFreeTransformContext(c_transform_context);
+  }
 
-  parse_error_occurred = (Qfalse == rb_funcall(rb_error_str, rb_intern("empty?"), 0));
+  free_xslt_params(params, param_len);
 
-  if (parse_error_occurred) {
+  xsltSetGenericErrorFunc(previous_xslt_context, previous_xslt_handler);
+  xmlSetGenericErrorFunc(previous_xml_context, previous_xml_handler);
+  RB_GC_GUARD(self);
+  RB_GC_GUARD(rb_document);
+
+  if (state) {
+    xmlFreeDoc(c_result_document);
+    rb_jump_tag(state);
+  }
+  if (RSTRING_LEN(rb_error_str)) {
+    xmlFreeDoc(c_result_document);
     rb_exc_raise(rb_exc_new3(rb_eRuntimeError, rb_error_str));
+  }
+  if (!c_result_document) {
+    rb_raise(rb_eRuntimeError, "Could not transform document");
   }
 
   return noko_xml_document_wrap((VALUE)0, c_result_document) ;
 }
 
-static void
-method_caller(xmlXPathParserContextPtr ctxt, int nargs)
+typedef struct {
+  xmlXPathParserContextPtr ctxt;
+  int nargs;
+} xslt_method_args;
+
+static VALUE
+method_caller_protected(VALUE data)
 {
+  xslt_method_args *args = (xslt_method_args *)data;
+  xmlXPathParserContextPtr ctxt = args->ctxt;
   VALUE handler;
   const char *function_name;
   xsltTransformContextPtr transform;
@@ -384,20 +430,52 @@ method_caller(xmlXPathParserContextPtr ctxt, int nargs)
 
   transform = xsltXPathGetTransformContext(ctxt);
   functionURI = ctxt->context->functionURI;
-  handler = (VALUE)xsltGetExtData(transform, functionURI);
+  VALUE module_data = (VALUE)xsltGetExtData(transform, functionURI);
+  if (transform->_private) {
+    return Qnil;
+  }
+  handler = rb_ary_entry(module_data, 0);
   function_name = (const char *)(ctxt->context->function);
 
   Nokogiri_marshal_xpath_funcall_and_return_values(
     ctxt,
-    nargs,
+    args->nargs,
     handler,
-    (const char *)function_name
+    (const char *)function_name,
+    rb_ary_entry(module_data, 1)
   );
+  return Qnil;
 }
 
-static void *
-initFunc(xsltTransformContextPtr ctxt, const xmlChar *uri)
+static void
+method_caller(xmlXPathParserContextPtr ctxt, int nargs)
 {
+  xsltTransformContextPtr transform = xsltXPathGetTransformContext(ctxt);
+  if (!transform->_private) {
+    xslt_method_args args = { ctxt, nargs };
+    int state = 0;
+    rb_protect(method_caller_protected, (VALUE)&args, &state);
+    if (state) {
+      transform->_private = (void *)(intptr_t)state;
+    }
+  }
+  if (transform->_private) {
+    transform->state = XSLT_STATE_STOPPED;
+    ctxt->error = XPATH_EXPR_ERROR;
+  }
+}
+
+typedef struct {
+  xsltTransformContextPtr ctxt;
+  const xmlChar *uri;
+} xslt_init_args;
+
+static VALUE
+initFunc_protected(VALUE data)
+{
+  xslt_init_args *init_args = (xslt_init_args *)data;
+  xsltTransformContextPtr ctxt = init_args->ctxt;
+  const xmlChar *uri = init_args->uri;
   VALUE modules = rb_iv_get(mNokogiriXslt, "@modules");
   VALUE obj = rb_hash_aref(modules, rb_str_new2((const char *)uri));
   VALUE args = { Qfalse };
@@ -423,9 +501,29 @@ initFunc(xsltTransformContextPtr ctxt, const xmlChar *uri)
     wrapper
   );
   inst = rb_class_new_instance(0, NULL, obj);
-  rb_ary_push(wrapper->func_instances, inst);
+  VALUE retained_nodes = rb_ary_new();
+  VALUE module_data = rb_ary_new_from_args(2, inst, retained_nodes);
+  rb_ary_push(wrapper->func_instances, module_data);
 
-  return (void *)inst;
+  return module_data;
+}
+
+static void *
+initFunc(xsltTransformContextPtr ctxt, const xmlChar *uri)
+{
+  if (ctxt->_private) {
+    return NULL;
+  }
+  xslt_init_args args = { ctxt, uri };
+  int state = 0;
+  VALUE module_data = rb_protect(initFunc_protected, (VALUE)&args, &state);
+  if (state) {
+    /* Delay Ruby's nonlocal exit until libxslt has released the transform context. */
+    ctxt->_private = (void *)(intptr_t)state;
+    ctxt->state = XSLT_STATE_STOPPED;
+    return NULL;
+  }
+  return (void *)module_data;
 }
 
 static void
@@ -441,7 +539,12 @@ shutdownFunc(xsltTransformContextPtr ctxt,
     wrapper
   );
 
-  rb_ary_clear(wrapper->func_instances);
+  for (long i = 0; i < RARRAY_LEN(wrapper->func_instances); i++) {
+    if (rb_ary_entry(wrapper->func_instances, i) == (VALUE)data) {
+      rb_ary_delete_at(wrapper->func_instances, i);
+      break;
+    }
+  }
 }
 
 /* docstring is in lib/nokogiri/xslt.rb */

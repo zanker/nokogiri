@@ -234,12 +234,17 @@ module Nokogiri
     end
 
     def gc_verify_compaction_references
+      previous_stress = GC.stress
+      # The heap-expanding verifier can reenter GC bookkeeping when GC.stress is enabled.
+      GC.stress = false
       # https://alanwu.space/post/check-compaction/
       if Gem::Requirement.new(">= 3.2.0").satisfied_by?(Gem::Version.new(RUBY_VERSION))
         GC.verify_compaction_references(expand_heap: true, toward: :empty)
       else
         GC.verify_compaction_references(double_heap: true, toward: :empty)
       end
+    ensure
+      GC.stress = previous_stress
     end
 
     def stress_memory_while(&block)

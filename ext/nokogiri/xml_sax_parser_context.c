@@ -228,6 +228,8 @@ noko_xml_sax_parser_context__parse_with(VALUE rb_context, VALUE rb_sax_parser)
    * don't have any cleanup to do. The only memory we need to free is handled by
    * xml_sax_parser_context_type_free */
   xmlParseDocument(c_context);
+  RB_GC_GUARD(rb_sax_parser);
+  RB_GC_GUARD(rb_context);
 
   return Qnil;
 }

@@ -519,6 +519,8 @@ noko_gumbo_s_fragment(int argc, VALUE *argv, VALUE _self)
   GumboQuirksModeEnum quirks_mode;
   bool form = false;
   const char *encoding = NULL;
+  VALUE tag_name = Qnil;
+  VALUE enc = Qnil;
 
   rb_scan_args(argc, argv, "3:", &doc_fragment, &tags, &ctx, &kwargs);
   if (NIL_P(kwargs)) {
@@ -572,7 +574,7 @@ error:
     ID element_ = rb_intern_const("element?");
 
     // Context fragment name.
-    VALUE tag_name = rb_funcall(ctx, name, 0);
+    tag_name = rb_funcall(ctx, name, 0);
     assert(RTEST(tag_name));
     Check_Type(tag_name, T_STRING);
     ctx_tag = StringValueCStr(tag_name);
@@ -600,9 +602,9 @@ error:
     if (ctx_ns == GUMBO_NAMESPACE_MATHML
         && RSTRING_LEN(tag_name) == 14
         && !st_strcasecmp(ctx_tag, "annotation-xml")) {
-      VALUE enc = rb_funcall(ctx, rb_intern_const("[]"),
-                             1,
-                             rb_utf8_str_new_static("encoding", 8));
+      enc = rb_funcall(ctx, rb_intern_const("[]"),
+                       1,
+                       rb_utf8_str_new_static("encoding", 8));
       if (RTEST(enc)) {
         Check_Type(enc, T_STRING);
         encoding = StringValueCStr(enc);
@@ -640,6 +642,9 @@ error:
   if (options.max_tree_depth < UINT_MAX) { options.max_tree_depth++; }
 
   GumboOutput *output = perform_parse(&options, tags);
+  RB_GC_GUARD(ctx);
+  RB_GC_GUARD(tag_name);
+  RB_GC_GUARD(enc);
   ParseArgs args = {
     .output = output,
     .input = tags,

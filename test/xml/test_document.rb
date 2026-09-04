@@ -669,6 +669,8 @@ module Nokogiri
 
           result = refute_valgrind_errors(yield_on_jruby: true) { doc.encoding }
           assert_equal("UTF-8", result)
+          doc.encoding = "ISO-8859-1"
+          assert_equal("ISO-8859-1", doc.encoding)
         end
 
         def test_memory_explosion_on_invalid_xml

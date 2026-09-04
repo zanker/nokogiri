@@ -572,13 +572,29 @@ noko_xml_document__create_entity(int argc, VALUE *argv, VALUE rb_document)
   return noko_xml_node_wrap(cNokogiriXmlEntityDecl, (xmlNodePtr)c_entity);
 }
 
+typedef struct {
+  VALUE block;
+  VALUE io;
+  int state;
+  xmlNodePtr node;
+  xmlNodePtr parent;
+} canonicalize_block_args;
+
 static int
-block_caller(void *ctx, xmlNodePtr c_node, xmlNodePtr c_parent_node)
+canonicalize_write(void *ctx, const char *buffer, int len)
 {
-  VALUE block = (VALUE)ctx;
+  canonicalize_block_args *args = ctx;
+  return args->state ? len : noko_io_write((void *)args->io, (char *)buffer, len);
+}
+
+static VALUE
+block_caller_protected(VALUE data)
+{
+  canonicalize_block_args *args = (canonicalize_block_args *)data;
+  xmlNodePtr c_node = args->node;
+  xmlNodePtr c_parent_node = args->parent;
   VALUE rb_node;
   VALUE rb_parent_node;
-  VALUE ret;
 
   if (c_node->type == XML_NAMESPACE_DECL) {
     rb_node = noko_xml_namespace_wrap((xmlNsPtr)c_node, c_parent_node->doc);
@@ -587,9 +603,20 @@ block_caller(void *ctx, xmlNodePtr c_node, xmlNodePtr c_parent_node)
   }
   rb_parent_node = c_parent_node ? noko_xml_node_wrap(Qnil, c_parent_node) : Qnil;
 
-  ret = rb_funcall(block, rb_intern("call"), 2, rb_node, rb_parent_node);
+  return rb_funcall(args->block, rb_intern("call"), 2, rb_node, rb_parent_node);
+}
 
-  return (Qfalse == ret || Qnil == ret) ? 0 : 1;
+static int
+block_caller(void *ctx, xmlNodePtr c_node, xmlNodePtr c_parent_node)
+{
+  canonicalize_block_args *args = ctx;
+  if (args->state) {
+    return 0;
+  }
+  args->node = c_node;
+  args->parent = c_parent_node;
+  VALUE result = rb_protect(block_caller_protected, (VALUE)args, &args->state);
+  return RTEST(result);
 }
 
 /* call-seq:
@@ -609,12 +636,14 @@ rb_xml_document_canonicalize(int argc, VALUE *argv, VALUE self)
   VALUE rb_namespaces;
   VALUE rb_comments_p;
   int c_mode = 0;
-  xmlChar **c_namespaces;
+  xmlChar **c_namespaces = NULL;
+  VALUE namespaces_handle = 0;
+  VALUE strings_handle = 0;
 
   xmlDocPtr c_doc;
   xmlOutputBufferPtr c_obuf;
   xmlC14NIsVisibleCallback c_callback_wrapper = NULL;
-  void *rb_callback = NULL;
+  canonicalize_block_args block_args = { Qnil, Qnil, 0, NULL, NULL };
 
   VALUE rb_cStringIO;
   VALUE rb_io;
@@ -633,38 +662,51 @@ rb_xml_document_canonicalize(int argc, VALUE *argv, VALUE self)
 
   c_doc = noko_xml_document_unwrap(self);
 
-  rb_cStringIO = rb_const_get_at(rb_cObject, rb_intern("StringIO"));
-  rb_io = rb_class_new_instance(0, 0, rb_cStringIO);
-  c_obuf = xmlAllocOutputBuffer(NULL);
-
-  c_obuf->writecallback = (xmlOutputWriteCallback)noko_io_write;
-  c_obuf->closecallback = (xmlOutputCloseCallback)noko_io_close;
-  c_obuf->context = (void *)rb_io;
+  if (!NIL_P(rb_namespaces)) {
+    long ns_len = RARRAY_LEN(rb_namespaces);
+    c_namespaces = rb_alloc_tmp_buffer2(&namespaces_handle, ns_len + 1, sizeof(xmlChar *));
+    VALUE *strings = rb_alloc_tmp_buffer2(&strings_handle, ns_len, sizeof(VALUE));
+    memset(strings, 0, (size_t)ns_len * sizeof(VALUE));
+    for (long j = 0; j < ns_len; j++) {
+      VALUE entry = rb_ary_entry(rb_namespaces, j);
+      /* Temporary buffer roots pin the snapshots while coercions and callbacks run Ruby. */
+      strings[j] = rb_str_new_frozen(StringValue(entry));
+      c_namespaces[j] = (xmlChar *)StringValueCStr(strings[j]);
+    }
+    c_namespaces[ns_len] = NULL;
+  }
 
   if (rb_block_given_p()) {
     c_callback_wrapper = block_caller;
-    rb_callback = (void *)rb_block_proc();
+    block_args.block = rb_block_proc();
   }
 
-  if (NIL_P(rb_namespaces)) {
-    c_namespaces = NULL;
-  } else {
-    long ns_len = RARRAY_LEN(rb_namespaces);
-    c_namespaces = ruby_xcalloc((size_t)ns_len + 1, sizeof(xmlChar *));
-    for (int j = 0 ; j < ns_len ; j++) {
-      VALUE entry = rb_ary_entry(rb_namespaces, j);
-      c_namespaces[j] = (xmlChar *)StringValueCStr(entry);
-    }
+  rb_cStringIO = rb_const_get_at(rb_cObject, rb_intern("StringIO"));
+  rb_io = rb_class_new_instance(0, 0, rb_cStringIO);
+  block_args.io = rb_io;
+  c_obuf = xmlAllocOutputBuffer(NULL);
+  if (!c_obuf) {
+    rb_memerror();
   }
 
-  int ret = xmlC14NExecute(c_doc, c_callback_wrapper, rb_callback,
+  c_obuf->writecallback = canonicalize_write;
+  c_obuf->closecallback = (xmlOutputCloseCallback)noko_io_close;
+  c_obuf->context = &block_args;
+
+  int ret = xmlC14NExecute(c_doc, c_callback_wrapper, &block_args,
                            c_mode,
                            c_namespaces,
                            (int)RTEST(rb_comments_p),
                            c_obuf);
 
-  ruby_xfree(c_namespaces);
+  ALLOCV_END(strings_handle);
+  ALLOCV_END(namespaces_handle);
   xmlOutputBufferClose(c_obuf);
+  RB_GC_GUARD(self);
+  RB_GC_GUARD(block_args.block);
+  if (block_args.state) {
+    rb_jump_tag(block_args.state);
+  }
 
   if (ret < 0) {
     rb_raise(rb_eRuntimeError, "canonicalization failed");
