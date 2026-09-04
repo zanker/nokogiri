@@ -503,16 +503,44 @@ extract_xml_node(VALUE node)
 
 static VALUE fragment_continue(VALUE parse_args);
 
-/*
- *  @!visibility protected
- */
-static VALUE
-noko_gumbo_s_fragment(int argc, VALUE *argv, VALUE _self)
-{
+typedef struct {
   VALUE doc_fragment;
   VALUE tags;
-  VALUE ctx;
+  VALUE context;
   VALUE kwargs;
+  char *context_tag;
+  char *encoding;
+} FragmentArgs;
+
+static char *
+copy_context_string(VALUE string)
+{
+  StringValueCStr(string);
+  size_t len = (size_t)RSTRING_LEN(string);
+  char *copy = ruby_xmalloc(len + 1);
+  /* Allocation can trigger GC; borrow the string's bytes only after it completes. */
+  memcpy(copy, RSTRING_PTR(string), len + 1);
+  RB_GC_GUARD(string);
+  return copy;
+}
+
+static VALUE
+fragment_cleanup(VALUE data)
+{
+  FragmentArgs *args = (FragmentArgs *)data;
+  ruby_xfree(args->context_tag);
+  ruby_xfree(args->encoding);
+  return Qnil;
+}
+
+static VALUE
+fragment_parse(VALUE data)
+{
+  FragmentArgs *fragment_args = (FragmentArgs *)data;
+  VALUE doc_fragment = fragment_args->doc_fragment;
+  VALUE tags = fragment_args->tags;
+  VALUE ctx = fragment_args->context;
+  VALUE kwargs = fragment_args->kwargs;
   ID name = rb_intern_const("name");
   const char *ctx_tag;
   GumboNamespaceEnum ctx_ns;
@@ -522,7 +550,6 @@ noko_gumbo_s_fragment(int argc, VALUE *argv, VALUE _self)
   VALUE tag_name = Qnil;
   VALUE enc = Qnil;
 
-  rb_scan_args(argc, argv, "3:", &doc_fragment, &tags, &ctx, &kwargs);
   if (NIL_P(kwargs)) {
     kwargs = rb_hash_new();
   }
@@ -533,9 +560,10 @@ noko_gumbo_s_fragment(int argc, VALUE *argv, VALUE _self)
     ctx_tag = "body";
     ctx_ns = GUMBO_NAMESPACE_HTML;
   } else if (TYPE(ctx) == T_STRING) {
-    ctx_tag = StringValueCStr(ctx);
+    fragment_args->context_tag = copy_context_string(ctx);
+    ctx_tag = fragment_args->context_tag;
     ctx_ns = GUMBO_NAMESPACE_HTML;
-    size_t len = (size_t)RSTRING_LEN(ctx);
+    size_t len = strlen(ctx_tag);
     const char *colon = memchr(ctx_tag, ':', len);
     if (colon) {
       switch (colon - ctx_tag) {
@@ -577,7 +605,8 @@ error:
     tag_name = rb_funcall(ctx, name, 0);
     assert(RTEST(tag_name));
     Check_Type(tag_name, T_STRING);
-    ctx_tag = StringValueCStr(tag_name);
+    fragment_args->context_tag = copy_context_string(tag_name);
+    ctx_tag = fragment_args->context_tag;
 
     // Context fragment namespace.
     ctx_ns = lookup_namespace(ctx, true);
@@ -600,14 +629,15 @@ error:
 
     // Encoding.
     if (ctx_ns == GUMBO_NAMESPACE_MATHML
-        && RSTRING_LEN(tag_name) == 14
+        && strlen(ctx_tag) == 14
         && !st_strcasecmp(ctx_tag, "annotation-xml")) {
       enc = rb_funcall(ctx, rb_intern_const("[]"),
                        1,
                        rb_utf8_str_new_static("encoding", 8));
       if (RTEST(enc)) {
         Check_Type(enc, T_STRING);
-        encoding = StringValueCStr(enc);
+        fragment_args->encoding = copy_context_string(enc);
+        encoding = fragment_args->encoding;
       }
     }
   }
@@ -653,6 +683,17 @@ error:
   };
   rb_ensure(fragment_continue, (VALUE)(&args), parse_cleanup, (VALUE)(&args));
   return Qnil;
+}
+
+/*
+ *  @!visibility protected
+ */
+static VALUE
+noko_gumbo_s_fragment(int argc, VALUE *argv, VALUE _self)
+{
+  FragmentArgs args = {0};
+  rb_scan_args(argc, argv, "3:", &args.doc_fragment, &args.tags, &args.context, &args.kwargs);
+  return rb_ensure(fragment_parse, (VALUE)&args, fragment_cleanup, (VALUE)&args);
 }
 
 static VALUE

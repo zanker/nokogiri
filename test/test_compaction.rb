@@ -16,8 +16,8 @@ describe "compaction" do
     GC.auto_compact = previous_auto_compact
   end
 
-  [:nodes, :namespaces].product([false, true]).each do |result_type, return_array|
-    describe "callback #{result_type} as #{return_array ? "arrays" : "node sets"}" do
+  [:nodes, :namespaces].product([false, true], [false, true]).each do |result_type, return_array, clear_result|
+    describe "callback #{result_type} as #{return_array ? "arrays" : "node sets"} (cleared: #{clear_result})" do
       let(:function_class) do
         compact = method(:gc_verify_compaction_references)
         selector = (result_type == :namespaces) ? "/other/namespace::*" : "/other/child"
@@ -26,11 +26,23 @@ describe "compaction" do
             document = Nokogiri::XML('<other xmlns:kept="urn:kept"><child>retained</child></other>')
             @document = WeakRef.new(document)
             nodes = document.xpath(selector)
-            return_array ? nodes.to_a : nodes
+            if clear_result && !return_array
+              nodes = Nokogiri::XML::NodeSet.new(Nokogiri::XML("<owner/>"), nodes.to_a)
+            end
+            result = return_array ? nodes.to_a : nodes
+            @result = result if clear_result
+            result
           end
 
           def empty
             Nokogiri::XML("<empty/>").xpath("missing")
+          end
+
+          def clear
+            until @result.empty?
+              @result.pop
+            end
+            empty
           end
 
           define_method(:verify) do
@@ -48,7 +60,8 @@ describe "compaction" do
 
         handler = function_class.new
         document = Nokogiri::XML("<root/>")
-        expression = "(nokogiri:fresh() | nokogiri:empty() | nokogiri:empty())[nokogiri:verify()]"
+        next_function = clear_result ? "clear" : "empty"
+        expression = "(nokogiri:fresh() | nokogiri:#{next_function}() | nokogiri:empty())[nokogiri:verify()]"
         expression += "/parent::node()" if result_type == :namespaces
 
         with_auto_compaction do
@@ -61,7 +74,8 @@ describe "compaction" do
       it "keeps returned XSLT nodes alive until the transform finishes" do
         skip("GC compaction is unavailable") if skip_compaction_tests
 
-        expression = "(ext:fresh() | ext:empty() | ext:empty())[ext:verify()]"
+        next_function = clear_result ? "clear" : "empty"
+        expression = "(ext:fresh() | ext:#{next_function}() | ext:empty())[ext:verify()]"
         expression += "/parent::node()" if result_type == :namespaces
         stylesheet = Nokogiri::XSLT(<<~XML, "urn:retained-results" => function_class)
           <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
@@ -122,6 +136,44 @@ describe "compaction" do
 
   if Nokogiri.uses_gumbo?
     describe Nokogiri::HTML5::DocumentFragment do
+      it "releases context buffers when a callback raises or throws" do
+        document = Nokogiri::HTML5('<math><annotation-xml encoding="text/html"/></math>')
+        context = document.at_css("annotation-xml")
+        error = RuntimeError.new("expected")
+        action = -> { raise error }
+        document.define_singleton_method(:internal_subset) { action.call }
+
+        assert_same(error, assert_raises(RuntimeError) do
+          Nokogiri::HTML5::DocumentFragment.new(document, "<a>ok</a>", context)
+        end)
+        action = -> { throw(:stop, :done) }
+        assert_equal(:done, catch(:stop) do
+          Nokogiri::HTML5::DocumentFragment.new(document, "<a>ok</a>", context)
+        end)
+        action = -> {}
+
+        fragment = Nokogiri::HTML5::DocumentFragment.new(document, "<a>ok</a>", context)
+        assert_equal("<a>ok</a>", fragment.to_html)
+      end
+
+      it "snapshots context names and encodings before later callbacks" do
+        document = Nokogiri::HTML5('<math><annotation-xml encoding="text/html"/></math>')
+        context = document.at_css("annotation-xml")
+        tag_name = +"annotation-xml"
+        encoding = +"text/html"
+        context.define_singleton_method(:name) { tag_name }
+        context.define_singleton_method(:[]) { |_key| encoding }
+        document.define_singleton_method(:internal_subset) do
+          tag_name.clear
+          encoding.clear
+          nil
+        end
+
+        fragment = Nokogiri::HTML5::DocumentFragment.new(document, "<a>ok</a>", context)
+        assert_equal("<a>ok</a>", fragment.to_html)
+        assert_nil(fragment.children.first.namespace)
+      end
+
       it "retains temporary context names and encodings across compaction" do
         skip("GC compaction is unavailable") if skip_compaction_tests
 

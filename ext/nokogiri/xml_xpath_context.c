@@ -252,6 +252,22 @@ _noko_xml_xpath_context__xpath2ruby(xmlXPathObjectPtr c_xpath_object, xmlXPathCo
          );
 }
 
+static xmlNodeSetPtr
+_noko_xml_xpath_context__copy_node_set(VALUE rb_node_set, VALUE rb_retained_nodes)
+{
+  xmlNodeSetPtr c_node_set = noko_xml_node_set_unwrap(rb_node_set);
+
+  /* Later callbacks can mutate the original NodeSet while libxml2 still uses its copy. */
+  for (int j = 0; j < c_node_set->nodeNr; j++) {
+    VALUE rb_node = noko_xml_node_wrap_node_set_result(c_node_set->nodeTab[j], rb_node_set);
+    rb_ary_push(rb_retained_nodes, rb_node);
+  }
+
+  xmlNodeSetPtr copy = xmlXPathNodeSetMerge(NULL, c_node_set);
+  RB_GC_GUARD(rb_node_set);
+  return copy;
+}
+
 void
 Nokogiri_marshal_xpath_funcall_and_return_values(
   xmlXPathParserContextPtr ctxt,
@@ -265,7 +281,6 @@ Nokogiri_marshal_xpath_funcall_and_return_values(
   VALUE *argv;
   VALUE argv_handle;
   VALUE rb_node_set = Qnil;
-  xmlNodeSetPtr c_node_set = NULL;
   xmlXPathObjectPtr c_xpath_object;
 
   assert(ctxt->context->doc);
@@ -307,17 +322,12 @@ Nokogiri_marshal_xpath_funcall_and_return_values(
     case T_ARRAY: {
       VALUE construct_args[2] = { DOC_RUBY_OBJECT(ctxt->context->doc), rb_retval };
       rb_node_set = rb_class_new_instance(2, construct_args, cNokogiriXmlNodeSet);
-      rb_ary_push(rb_retained_nodes, rb_node_set);
-      c_node_set = noko_xml_node_set_unwrap(rb_node_set);
-      xmlXPathReturnNodeSet(ctxt, xmlXPathNodeSetMerge(NULL, c_node_set));
+      xmlXPathReturnNodeSet(ctxt, _noko_xml_xpath_context__copy_node_set(rb_node_set, rb_retained_nodes));
     }
     break;
     case T_DATA:
       if (rb_obj_is_kind_of(rb_retval, cNokogiriXmlNodeSet)) {
-        rb_ary_push(rb_retained_nodes, rb_retval);
-        c_node_set = noko_xml_node_set_unwrap(rb_retval);
-        /* libxml2 owns the copied set; Ruby owns the nodes and their documents. */
-        xmlXPathReturnNodeSet(ctxt, xmlXPathNodeSetMerge(NULL, c_node_set));
+        xmlXPathReturnNodeSet(ctxt, _noko_xml_xpath_context__copy_node_set(rb_retval, rb_retained_nodes));
         break;
       }
     default:
