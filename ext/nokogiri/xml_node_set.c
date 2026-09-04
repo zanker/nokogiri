@@ -501,8 +501,16 @@ noko_xml_node_set_wrap(xmlNodeSetPtr c_node_set, VALUE document)
 
   if (c_node_set) {
     /* create ruby objects for all the results, so they'll be marked during the GC mark phase */
+    /* Namespace copies need owners before ordinary node decorators can exit nonlocally. */
     for (j = 0 ; j < c_node_set->nodeNr ; j++) {
-      noko_xml_node_wrap_node_set_result(c_node_set->nodeTab[j], rb_node_set);
+      if (NOKOGIRI_NAMESPACE_EH(c_node_set->nodeTab[j])) {
+        noko_xml_node_wrap_node_set_result(c_node_set->nodeTab[j], rb_node_set);
+      }
+    }
+    for (j = 0 ; j < c_node_set->nodeNr ; j++) {
+      if (!NOKOGIRI_NAMESPACE_EH(c_node_set->nodeTab[j])) {
+        noko_xml_node_wrap_node_set_result(c_node_set->nodeTab[j], rb_node_set);
+      }
     }
   }
 

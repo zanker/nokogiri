@@ -62,6 +62,31 @@ module Nokogiri
         assert_equal("child", context.evaluate("child").first.name)
       end
 
+      it "owns namespace results before node decorators exit nonlocally" do
+        skip_unless_libxml2("native XPath result ownership")
+
+        [:raise, :throw].each do |exit_type|
+          doc = Document.parse('<root><child/><next xmlns:kept="urn:kept"/></root>')
+          context = XPathContext.new(doc.root)
+          decorator = Module.new do
+            define_singleton_method(:extended) do |_node|
+              raise "expected" if exit_type == :raise
+
+              throw(:stop, :done)
+            end
+          end
+          doc.decorators(Node) << decorator
+
+          refute_valgrind_errors do
+            if exit_type == :raise
+              assert_raises(RuntimeError) { context.evaluate("child | next/namespace::*") }
+            else
+              assert_equal(:done, catch(:stop) { context.evaluate("child | next/namespace::*") })
+            end
+          end
+        end
+      end
+
       it "can register and deregister namespaces" do
         doc = Document.parse(<<~XML)
           <root xmlns="http://nokogiri.org/default" xmlns:ns1="http://nokogiri.org/ns1">
