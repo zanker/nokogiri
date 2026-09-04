@@ -3,7 +3,7 @@
 VALUE cNokogiriXsltStylesheet;
 
 static void
-mark(void *data)
+_noko_xslt_stylesheet_mark(void *data)
 {
   nokogiriXsltStylesheetTuple *wrapper = (nokogiriXsltStylesheetTuple *)data;
   rb_gc_mark(wrapper->func_instances);
@@ -24,11 +24,9 @@ dealloc(void *data)
   ruby_xfree(wrapper);
 }
 
-/* Nokogiri_wrap_xslt_stylesheet stores this object's own VALUE in the libxslt stylesheet's
- * `_private`, and initFunc reads it back on every transform, so that copy has to be updated when the
- * object moves -- the same treatment xmlNode and xmlNamespace already give their `_private`. */
+/* libxslt retains the stylesheet wrapper's movable VALUE in _private. */
 static void
-update_references(void *data)
+_noko_xslt_stylesheet_update_references(void *data)
 {
   nokogiriXsltStylesheetTuple *wrapper = (nokogiriXsltStylesheetTuple *)data;
 
@@ -40,9 +38,9 @@ update_references(void *data)
 static const rb_data_type_t nokogiri_xslt_stylesheet_tuple_type = {
   .wrap_struct_name = "nokogiriXsltStylesheetTuple",
   .function = {
-    .dmark = mark,
+    .dmark = _noko_xslt_stylesheet_mark,
     .dfree = dealloc,
-    .dcompact = update_references,
+    .dcompact = _noko_xslt_stylesheet_update_references,
   },
   .flags = RUBY_TYPED_FREE_IMMEDIATELY
 };
@@ -155,11 +153,7 @@ rb_xslt_stylesheet_serialize(VALUE self, VALUE xmlobj)
 
 
 /*
- * Build the C-string params array passed to xsltApplyStylesheet.
- *
- * The bytes are copied rather than pointed at: StringValueCStr runs arbitrary Ruby (#to_str on a
- * non-String, or a reallocation to null-terminate), which may collect or relocate the strings
- * converted on earlier iterations, as may anything that allocates before xsltApplyStylesheet.
+ * Copy each parameter because later string coercions can move earlier Ruby strings.
  */
 typedef struct {
   VALUE rb_param;
@@ -168,7 +162,7 @@ typedef struct {
 } build_xslt_params_args_t;
 
 static VALUE
-build_xslt_params(VALUE args_ptr)
+_noko_xslt_stylesheet_build_params(VALUE args_ptr)
 {
   build_xslt_params_args_t *args = (build_xslt_params_args_t *)args_ptr;
 
@@ -182,7 +176,7 @@ build_xslt_params(VALUE args_ptr)
 }
 
 static void
-free_xslt_params(const char **params, long param_len)
+_noko_xslt_stylesheet_free_params(const char **params, long param_len)
 {
   for (long j = 0; j < param_len; j++) {
     ruby_xfree(DISCARD_CONST_QUAL(char *, params[j]));
@@ -191,7 +185,7 @@ free_xslt_params(const char **params, long param_len)
 }
 
 static VALUE
-xslt_stylesheet_copy_document(VALUE rb_document)
+_noko_xslt_stylesheet_copy_document(VALUE rb_document)
 {
   xmlDocPtr copy = xmlCopyDoc(noko_xml_document_unwrap(rb_document), 1);
   RB_GC_GUARD(rb_document);
@@ -345,17 +339,16 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
 
   param_len = RARRAY_LEN(rb_param);
   params = ruby_xcalloc((size_t)param_len + 1, sizeof(char *));
-  {
-    // populate params under rb_protect so that a raise from StringValueCStr
-    // (e.g. on a null byte) does not leak the params allocation.
-    build_xslt_params_args_t args = { rb_param, param_len, params };
-    int state = 0;
-
-    rb_protect(build_xslt_params, (VALUE)&args, &state);
-    if (state) {
-      free_xslt_params(params, param_len);
-      rb_jump_tag(state);
-    }
+  // String coercion can raise after some parameter buffers have been allocated.
+  build_xslt_params_args_t params_args = {
+    .rb_param = rb_param,
+    .param_len = param_len,
+    .params = params,
+  };
+  rb_protect(_noko_xslt_stylesheet_build_params, (VALUE)&params_args, &state);
+  if (state) {
+    _noko_xslt_stylesheet_free_params(params, param_len);
+    rb_jump_tag(state);
   }
   params[param_len] = 0 ;
 
@@ -374,7 +367,7 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
     xsltFreeTransformContext(c_transform_context);
     c_transform_context = NULL;
     /* Extension callbacks may retain nodes from the copy after the transform finishes. */
-    rb_document = rb_protect(xslt_stylesheet_copy_document, rb_document, &state);
+    rb_document = rb_protect(_noko_xslt_stylesheet_copy_document, rb_document, &state);
     if (!state) {
       c_document = noko_xml_document_unwrap(rb_document);
       c_transform_context = xsltNewTransformContext(wrapper->ss, c_document);
@@ -391,7 +384,7 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
     xsltFreeTransformContext(c_transform_context);
   }
 
-  free_xslt_params(params, param_len);
+  _noko_xslt_stylesheet_free_params(params, param_len);
 
   xsltSetGenericErrorFunc(previous_xslt_context, previous_xslt_handler);
   xmlSetGenericErrorFunc(previous_xml_context, previous_xml_handler);
@@ -419,7 +412,7 @@ typedef struct {
 } xslt_method_args;
 
 static VALUE
-method_caller_protected(VALUE data)
+_noko_xslt_stylesheet_method_caller_protected(VALUE data)
 {
   xslt_method_args *args = (xslt_method_args *)data;
   xmlXPathParserContextPtr ctxt = args->ctxt;
@@ -448,13 +441,13 @@ method_caller_protected(VALUE data)
 }
 
 static void
-method_caller(xmlXPathParserContextPtr ctxt, int nargs)
+_noko_xslt_stylesheet_method_caller(xmlXPathParserContextPtr ctxt, int nargs)
 {
   xsltTransformContextPtr transform = xsltXPathGetTransformContext(ctxt);
   if (!transform->_private) {
     xslt_method_args args = { ctxt, nargs };
     int state = 0;
-    rb_protect(method_caller_protected, (VALUE)&args, &state);
+    rb_protect(_noko_xslt_stylesheet_method_caller_protected, (VALUE)&args, &state);
     if (state) {
       transform->_private = (void *)(intptr_t)state;
     }
@@ -471,7 +464,7 @@ typedef struct {
 } xslt_init_args;
 
 static VALUE
-initFunc_protected(VALUE data)
+_noko_xslt_stylesheet_init_func_protected(VALUE data)
 {
   xslt_init_args *init_args = (xslt_init_args *)data;
   xsltTransformContextPtr ctxt = init_args->ctxt;
@@ -490,7 +483,7 @@ initFunc_protected(VALUE data)
       ctxt,
       (unsigned char *)StringValueCStr(method_name),
       uri,
-      method_caller
+      _noko_xslt_stylesheet_method_caller
     );
   }
 
@@ -509,14 +502,14 @@ initFunc_protected(VALUE data)
 }
 
 static void *
-initFunc(xsltTransformContextPtr ctxt, const xmlChar *uri)
+_noko_xslt_stylesheet_init_func(xsltTransformContextPtr ctxt, const xmlChar *uri)
 {
   if (ctxt->_private) {
     return NULL;
   }
   xslt_init_args args = { ctxt, uri };
   int state = 0;
-  VALUE module_data = rb_protect(initFunc_protected, (VALUE)&args, &state);
+  VALUE module_data = rb_protect(_noko_xslt_stylesheet_init_func_protected, (VALUE)&args, &state);
   if (state) {
     /* Delay Ruby's nonlocal exit until libxslt has released the transform context. */
     ctxt->_private = (void *)(intptr_t)state;
@@ -527,8 +520,8 @@ initFunc(xsltTransformContextPtr ctxt, const xmlChar *uri)
 }
 
 static void
-shutdownFunc(xsltTransformContextPtr ctxt,
-             const xmlChar *uri, void *data)
+_noko_xslt_stylesheet_shutdown_func(xsltTransformContextPtr ctxt,
+                                    const xmlChar *uri, void *data)
 {
   nokogiriXsltStylesheetTuple *wrapper;
 
@@ -559,8 +552,8 @@ rb_xslt_s_register(VALUE self, VALUE uri, VALUE obj)
   rb_hash_aset(modules, uri, obj);
   xsltRegisterExtModule(
     (unsigned char *)StringValueCStr(uri),
-    initFunc,
-    shutdownFunc
+    _noko_xslt_stylesheet_init_func,
+    _noko_xslt_stylesheet_shutdown_func
   );
   return self;
 }

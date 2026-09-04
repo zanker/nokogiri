@@ -515,7 +515,6 @@ noko_xml_node_set_wrap(xmlNodeSetPtr c_node_set, VALUE document)
   }
 
   if (!NIL_P(document)) {
-    /* Namespace copies need Ruby owners before a decorator can raise. */
     rb_funcall(document, decorate, 1, rb_node_set);
   }
 

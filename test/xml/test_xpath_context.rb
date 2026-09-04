@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "helper"
+require "weakref"
 
 module Nokogiri
   module XML
@@ -14,8 +15,6 @@ module Nokogiri
       end
 
       it "releases callback arguments when the callback raises" do
-        require "weakref"
-
         argument = nil
         handler = Object.new
         handler.define_singleton_method(:fail) do |value|

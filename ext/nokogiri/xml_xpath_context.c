@@ -195,7 +195,7 @@ typedef struct {
 
 /* Convert an XPath object, transferring node set ownership to its Ruby wrapper. */
 static VALUE
-xpath2ruby_convert(VALUE data)
+_noko_xml_xpath_context__xpath2ruby_convert(VALUE data)
 {
   xpath2ruby_args *args = (xpath2ruby_args *)data;
   xmlXPathObjectPtr c_xpath_object = args->xpath_object;
@@ -226,7 +226,7 @@ xpath2ruby_convert(VALUE data)
 }
 
 static VALUE
-xpath2ruby_cleanup(VALUE data)
+_noko_xml_xpath_context__xpath2ruby_cleanup(VALUE data)
 {
   xpath2ruby_args *args = (xpath2ruby_args *)data;
   xmlFree(args->string);
@@ -241,8 +241,15 @@ _noko_xml_xpath_context__xpath2ruby(xmlXPathObjectPtr c_xpath_object, xmlXPathCo
   assert(c_context->doc);
   assert(DOC_RUBY_OBJECT_TEST(c_context->doc));
 
-  xpath2ruby_args args = { c_xpath_object, c_context, NULL, string_fallback };
-  return rb_ensure(xpath2ruby_convert, (VALUE)&args, xpath2ruby_cleanup, (VALUE)&args);
+  xpath2ruby_args args = {
+    .xpath_object = c_xpath_object,
+    .context = c_context,
+    .string_fallback = string_fallback,
+  };
+  return rb_ensure(
+           _noko_xml_xpath_context__xpath2ruby_convert, (VALUE)&args,
+           _noko_xml_xpath_context__xpath2ruby_cleanup, (VALUE)&args
+         );
 }
 
 void
@@ -410,7 +417,7 @@ _noko_xml_xpath_context__generic_exception_pusher(void *data, const char *msg, .
 }
 
 static VALUE
-noko_xml_xpath_context_evaluate_protected(VALUE data)
+_noko_xml_xpath_context_evaluate_protected(VALUE data)
 {
   xmlXPathEvalExpr((xmlXPathParserContextPtr)data);
   return Qnil;
@@ -450,7 +457,10 @@ noko_xml_xpath_context_evaluate(int argc, VALUE *argv, VALUE rb_context)
   void *previous_lookup_data = c_context->funcLookupData;
   void *previous_user_data = c_context->userData;
   VALUE rb_retained_nodes = NIL_P(rb_function_lookup_handler) ? Qnil : rb_ary_new();
-  xpath_handler_args handler_args = { rb_function_lookup_handler, rb_retained_nodes, 0, NULL, 0, NULL, NULL };
+  xpath_handler_args handler_args = {
+    .handler = rb_function_lookup_handler,
+    .retained_nodes = rb_retained_nodes,
+  };
 
   if (Qnil != rb_function_lookup_handler) {
     /* FIXME: not sure if this is the correct place to shove private data. */
@@ -470,7 +480,7 @@ noko_xml_xpath_context_evaluate(int argc, VALUE *argv, VALUE rb_context)
   xmlResetError(&c_context->lastError);
   xmlXPathParserContextPtr c_parser = xmlXPathNewParserContext(c_expression_str, c_context);
   if (c_parser) {
-    rb_protect(noko_xml_xpath_context_evaluate_protected, (VALUE)c_parser, &state);
+    rb_protect(_noko_xml_xpath_context_evaluate_protected, (VALUE)c_parser, &state);
     if (handler_args.state) {
       state = handler_args.state;
     }

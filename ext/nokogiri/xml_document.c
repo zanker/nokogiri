@@ -581,14 +581,14 @@ typedef struct {
 } canonicalize_block_args;
 
 static int
-canonicalize_write(void *ctx, const char *buffer, int len)
+_noko_xml_document_canonicalize_write(void *ctx, const char *buffer, int len)
 {
   canonicalize_block_args *args = ctx;
   return args->state ? len : noko_io_write((void *)args->io, (char *)buffer, len);
 }
 
 static VALUE
-block_caller_protected(VALUE data)
+_noko_xml_document_canonicalize_callback_protected(VALUE data)
 {
   canonicalize_block_args *args = (canonicalize_block_args *)data;
   xmlNodePtr c_node = args->node;
@@ -607,7 +607,7 @@ block_caller_protected(VALUE data)
 }
 
 static int
-block_caller(void *ctx, xmlNodePtr c_node, xmlNodePtr c_parent_node)
+_noko_xml_document_canonicalize_callback(void *ctx, xmlNodePtr c_node, xmlNodePtr c_parent_node)
 {
   canonicalize_block_args *args = ctx;
   if (args->state) {
@@ -615,7 +615,7 @@ block_caller(void *ctx, xmlNodePtr c_node, xmlNodePtr c_parent_node)
   }
   args->node = c_node;
   args->parent = c_parent_node;
-  VALUE result = rb_protect(block_caller_protected, (VALUE)args, &args->state);
+  VALUE result = rb_protect(_noko_xml_document_canonicalize_callback_protected, (VALUE)args, &args->state);
   return RTEST(result);
 }
 
@@ -643,7 +643,10 @@ rb_xml_document_canonicalize(int argc, VALUE *argv, VALUE self)
   xmlDocPtr c_doc;
   xmlOutputBufferPtr c_obuf;
   xmlC14NIsVisibleCallback c_callback_wrapper = NULL;
-  canonicalize_block_args block_args = { Qnil, Qnil, 0, NULL, NULL };
+  canonicalize_block_args block_args = {
+    .block = Qnil,
+    .io = Qnil,
+  };
 
   VALUE rb_cStringIO;
   VALUE rb_io;
@@ -677,7 +680,7 @@ rb_xml_document_canonicalize(int argc, VALUE *argv, VALUE self)
   }
 
   if (rb_block_given_p()) {
-    c_callback_wrapper = block_caller;
+    c_callback_wrapper = _noko_xml_document_canonicalize_callback;
     block_args.block = rb_block_proc();
   }
 
@@ -689,7 +692,7 @@ rb_xml_document_canonicalize(int argc, VALUE *argv, VALUE self)
     rb_memerror();
   }
 
-  c_obuf->writecallback = canonicalize_write;
+  c_obuf->writecallback = _noko_xml_document_canonicalize_write;
   c_obuf->closecallback = (xmlOutputCloseCallback)noko_io_close;
   c_obuf->context = &block_args;
 

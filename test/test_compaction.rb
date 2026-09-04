@@ -1,16 +1,24 @@
 # frozen_string_literal: true
 
 require "helper"
+require "weakref"
 
 describe "compaction" do
   def skip_compaction_tests
     !GC.respond_to?(:verify_compaction_references)
   end
 
+  def with_auto_compaction
+    previous_auto_compact = GC.auto_compact
+    GC.auto_compact = true
+    yield
+  ensure
+    GC.auto_compact = previous_auto_compact
+  end
+
   [:nodes, :namespaces].product([false, true]).each do |result_type, return_array|
     describe "callback #{result_type} as #{return_array ? "arrays" : "node sets"}" do
       let(:function_class) do
-        require "weakref"
         compact = method(:gc_verify_compaction_references)
         selector = (result_type == :namespaces) ? "/other/namespace::*" : "/other/child"
         Class.new do
@@ -36,25 +44,22 @@ describe "compaction" do
       end
 
       it "keeps returned XPath nodes alive until evaluation finishes" do
-        skip if skip_compaction_tests
+        skip("GC compaction is unavailable") if skip_compaction_tests
 
         handler = function_class.new
         document = Nokogiri::XML("<root/>")
         expression = "(nokogiri:fresh() | nokogiri:empty() | nokogiri:empty())[nokogiri:verify()]"
         expression += "/parent::node()" if result_type == :namespaces
-        previous_auto_compact = GC.auto_compact
-        begin
-          GC.auto_compact = true
+
+        with_auto_compaction do
           result = stress_memory_while { document.xpath(expression, handler) }
           assert_equal([(result_type == :namespaces) ? "other" : "child"], result.map(&:name))
           assert_equal("retained", result.text)
-        ensure
-          GC.auto_compact = previous_auto_compact
         end
       end
 
       it "keeps returned XSLT nodes alive until the transform finishes" do
-        skip if skip_compaction_tests
+        skip("GC compaction is unavailable") if skip_compaction_tests
 
         expression = "(ext:fresh() | ext:empty() | ext:empty())[ext:verify()]"
         expression += "/parent::node()" if result_type == :namespaces
@@ -67,14 +72,11 @@ describe "compaction" do
           </xsl:stylesheet>
         XML
         document = Nokogiri::XML("<root/>")
-        previous_auto_compact = GC.auto_compact
-        begin
-          GC.auto_compact = true
+
+        with_auto_compaction do
           result = stress_memory_while { stylesheet.transform(document) }
           assert_equal([(result_type == :namespaces) ? "other" : "child"], result.root.element_children.map(&:name))
           assert_equal("retained", result.root.content)
-        ensure
-          GC.auto_compact = previous_auto_compact
         end
       end
     end
@@ -82,7 +84,7 @@ describe "compaction" do
 
   describe Nokogiri::XML::XPathContext do
     it "pins arguments in heap-allocated callback buffers" do
-      skip if skip_compaction_tests
+      skip("GC compaction is unavailable") if skip_compaction_tests
 
       compact = method(:gc_verify_compaction_references)
       handler = Object.new
@@ -100,7 +102,7 @@ describe "compaction" do
   [Nokogiri::XML::SAX, Nokogiri::HTML4::SAX].each do |sax|
     describe sax::ParserContext do
       it "pins the parser while callbacks compact the heap" do
-        skip if skip_compaction_tests
+        skip("GC compaction is unavailable") if skip_compaction_tests
 
         compact = method(:gc_verify_compaction_references)
         names = []
@@ -121,7 +123,7 @@ describe "compaction" do
   if Nokogiri.uses_gumbo?
     describe Nokogiri::HTML5::DocumentFragment do
       it "retains temporary context names and encodings across compaction" do
-        skip if skip_compaction_tests
+        skip("GC compaction is unavailable") if skip_compaction_tests
 
         compact = method(:gc_verify_compaction_references)
         document = Nokogiri::HTML5('<math><annotation-xml encoding="text/html"/></math>')
@@ -162,7 +164,7 @@ describe "compaction" do
 
   describe Nokogiri::XML::Document do
     it "retains inclusive namespaces while canonicalization callbacks compact" do
-      skip if skip_compaction_tests
+      skip("GC compaction is unavailable") if skip_compaction_tests
 
       namespace = Object.new
       namespace.define_singleton_method(:to_str) { +"kept" }
@@ -223,11 +225,10 @@ describe "compaction" do
   end
 
   describe Nokogiri::XML::SAX::PushParser do
-    it "keeps parsing after compaction" do # https://github.com/sparklemotion/nokogiri/issues/3665
-      skip if skip_compaction_tests
+    it "keeps parsing after compaction" do
+      skip("GC compaction is unavailable") if skip_compaction_tests
 
-      # the SAX parser whose address libxml2 holds is reachable only through PushParser's
-      # @sax_parser ivar, so nothing keeps it in place
+      # Keep the SAX parser off the machine stack so only PushParser's @sax_parser references it.
       parser = Nokogiri::XML::SAX::PushParser.new(Nokogiri::SAX::TestCase::Doc.new)
 
       gc_verify_compaction_references
@@ -240,8 +241,8 @@ describe "compaction" do
   end
 
   describe Nokogiri::HTML4::SAX::PushParser do
-    it "keeps parsing after compaction" do # https://github.com/sparklemotion/nokogiri/issues/3665
-      skip if skip_compaction_tests
+    it "keeps parsing after compaction" do
+      skip("GC compaction is unavailable") if skip_compaction_tests
 
       parser = Nokogiri::HTML4::SAX::PushParser.new(Nokogiri::SAX::TestCase::Doc.new)
 
@@ -255,11 +256,10 @@ describe "compaction" do
   end
 
   describe Nokogiri::XML::Reader do
-    it "reads an IO after compaction" do # https://github.com/sparklemotion/nokogiri/issues/3668
-      skip if skip_compaction_tests
+    it "reads an IO after compaction" do
+      skip("GC compaction is unavailable") if skip_compaction_tests
 
-      # the reader is built in a frame that pops, so the IO is reachable only through Reader#source.
-      # An IO held in a live local is pinned by the machine stack scan and would not move.
+      # Construct the IO in a separate frame so a live stack reference cannot pin it.
       reader = -> { Nokogiri::XML::Reader.from_io(StringIO.new("<root>#{"<a/>" * 100}</root>")) }.call
 
       gc_verify_compaction_references
@@ -270,11 +270,10 @@ describe "compaction" do
       assert_equal(["root"] + (["a"] * 100), names)
     end
 
-    it "reads a String after compaction" do # https://github.com/sparklemotion/nokogiri/issues/3666
-      skip if skip_compaction_tests
+    it "reads a String after compaction" do
+      skip("GC compaction is unavailable") if skip_compaction_tests
 
-      # a String this short carries its bytes in the object slot, so they move with it. Only libxml2
-      # < 2.11 reads the caller's buffer lazily; newer versions copy it up front.
+      # libxml2 < 2.11 reads this embedded string lazily, so its buffer must stay pinned.
       reader = -> { Nokogiri::XML::Reader.from_memory(+"<root><a>hello</a></root>") }.call
 
       gc_verify_compaction_references
@@ -287,8 +286,8 @@ describe "compaction" do
   end
 
   describe Nokogiri::XML::SAX::ParserContext do
-    it "parses an IO after compaction" do # https://github.com/sparklemotion/nokogiri/issues/3669
-      skip if skip_compaction_tests
+    it "parses an IO after compaction" do
+      skip("GC compaction is unavailable") if skip_compaction_tests
 
       context = -> { Nokogiri::XML::SAX::ParserContext.io(StringIO.new("<root><alpha/></root>")) }.call
 
@@ -306,7 +305,7 @@ describe "compaction" do
 
     [false, true].each do |nested|
       it "keeps extension instances alive during #{nested ? "nested" : "ordinary"} transforms" do
-        skip if skip_compaction_tests
+        skip("GC compaction is unavailable") if skip_compaction_tests
 
         compact = method(:gc_verify_compaction_references)
         stylesheet = nil
@@ -337,8 +336,8 @@ describe "compaction" do
       end
     end
 
-    it "transforms after compaction" do # https://github.com/sparklemotion/nokogiri/pull/3667
-      skip if skip_compaction_tests
+    it "transforms after compaction" do
+      skip("GC compaction is unavailable") if skip_compaction_tests
 
       Nokogiri::XSLT.register("http://nokogiri.org/test/compaction", Class.new do
         def shout(nodes)
@@ -355,8 +354,7 @@ describe "compaction" do
         </xsl:stylesheet>
       XSL
 
-      # libxslt reads the stylesheet's own VALUE back out of `_private` to set up the extension
-      # module, so the stylesheet is parked off the stack where the GC will move it
+      # Hold the stylesheet off the machine stack so its wrapper can move.
       held = [-> { Nokogiri::XSLT(stylesheet_source) }.call]
 
       gc_verify_compaction_references
@@ -364,12 +362,11 @@ describe "compaction" do
       assert_equal("JANE", held.first.transform(document).at_xpath("//out").text)
     end
 
-    it "keeps transform params intact when coercing one of them compacts" do # https://github.com/sparklemotion/nokogiri/issues/3670
-      skip if skip_compaction_tests
+    it "keeps transform params intact when coercing one of them compacts" do
+      skip("GC compaction is unavailable") if skip_compaction_tests
 
       compact = method(:gc_verify_compaction_references)
-      # StringValueCStr calls #to_str, which is arbitrary Ruby: it can relocate or collect the
-      # strings the params loop converted on earlier iterations
+      # A later coercion can move strings converted on earlier iterations.
       trigger = Class.new do
         define_method(:to_str) do
           compact.call

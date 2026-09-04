@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "helper"
+require "weakref"
 
 module Nokogiri
   class TestCase
@@ -14,9 +15,8 @@ module Nokogiri
       let(:doc) { Nokogiri::XML(File.open(XML_FILE)) }
 
       [:initialize, :call].each do |failure_point|
-        define_method("test_extension_#{failure_point}_nonlocal_exit_releases_instances") do
-          skip("Ruby extensions are only supported by libxslt") if Nokogiri.jruby?
-          require "weakref"
+        it "releases extension instances when #{failure_point} exits nonlocally" do
+          skip_unless_libxml2("Ruby extensions are only supported by libxslt")
 
           instances = []
           action = nil

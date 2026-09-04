@@ -6,7 +6,7 @@ module Nokogiri
   module XML
     class TestC14N < Nokogiri::TestCase
       def test_inclusive_namespace_coercion_keeps_temporary_strings_alive
-        skip("String coercion is a CRuby API") if Nokogiri.jruby?
+        skip_unless_libxml2("libxml2 namespace coercion")
 
         prefix = "prefix" + "p" * 1000
         doc = Nokogiri.XML(%(<doc xmlns:#{prefix}="urn:kept"><child/></doc>))
@@ -26,7 +26,7 @@ module Nokogiri
       end
 
       def test_inclusive_namespace_is_snapshotted_before_later_coercions
-        skip("String coercion is a CRuby API") if Nokogiri.jruby?
+        skip_unless_libxml2("libxml2 namespace coercion")
 
         prefix = +"kept"
         trigger = Object.new
