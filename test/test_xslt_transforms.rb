@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "helper"
+require "weakref"
 
 module Nokogiri
   class TestCase
@@ -12,6 +13,53 @@ module Nokogiri
       end
 
       let(:doc) { Nokogiri::XML(File.open(XML_FILE)) }
+
+      [:initialize, :call].each do |failure_point|
+        it "releases extension instances when #{failure_point} exits nonlocally" do
+          skip_unless_libxml2("Ruby extensions are only supported by libxslt")
+
+          instances = []
+          action = nil
+          extension = Class.new do
+            define_method(:initialize) do
+              instances << WeakRef.new(self)
+              action&.call if failure_point == :initialize
+            end
+            define_method(:call) do
+              action&.call if failure_point == :call
+              "success"
+            end
+          end
+          style = Nokogiri::XSLT(<<~XML, "urn:nonlocal-#{failure_point}" => extension)
+            <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                            xmlns:ext="urn:nonlocal-#{failure_point}" extension-element-prefixes="ext">
+              <xsl:strip-space elements="*"/>
+              <xsl:template match="doc"><out><xsl:value-of select="ext:call()"/></out></xsl:template>
+            </xsl:stylesheet>
+          XML
+          document = Nokogiri::XML("<doc> <child/> </doc>")
+          document.root.children.to_a
+          error = RuntimeError.new("expected")
+          action = -> { raise error }
+          assert_same(error, assert_raises(RuntimeError) { style.transform(document) })
+          action = -> { throw(:stop, :done) }
+          assert_equal(:done, catch(:stop) { style.transform(document) })
+          action = lambda do
+            action = -> { raise error }
+            style.transform(document)
+          end
+          assert_same(error, assert_raises(RuntimeError) { style.transform(document) })
+          action = lambda do
+            action = -> { throw(:stop, :nested) }
+            style.transform(document)
+          end
+          assert_equal(:nested, catch(:stop) { style.transform(document) })
+          action = nil
+          assert_equal("success", style.transform(document).root.content)
+          GC.start
+          instances.each { |instance| refute_predicate(instance, :weakref_alive?) }
+        end
+      end
 
       def test_class_methods
         style = Nokogiri::XSLT(File.read(XSLT_FILE))
