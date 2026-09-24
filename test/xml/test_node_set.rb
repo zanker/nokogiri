@@ -21,6 +21,23 @@ module Nokogiri
             assert_equal(expected_length, ns_list.length)
           end
 
+          it "keeps XPath namespace wrappers while pushing and copying under GC stress" do
+            skip_unless_libxml2("native namespace ownership")
+
+            namespaces = ns_list.to_a
+            namespaces.each(&:freeze)
+            target = Nokogiri::XML::NodeSet.new(ns_xml)
+            copy = stress_memory_while do
+              namespaces.each { |namespace| target.push(namespace) }
+              target.dup
+            end
+
+            namespaces.each_with_index do |namespace, index|
+              assert_same(namespace, target[index])
+              assert_same(namespace, copy[index])
+            end
+          end
+
           specify "#delete" do
             expected_length = ns_list.length
             ns_list.push(new_ns)
