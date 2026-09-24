@@ -72,4 +72,33 @@ describe "compaction" do
       end
     end
   end
+
+  describe Nokogiri::XSLT::Stylesheet do
+    let(:document) { Nokogiri::XML("<root><employee>Jane</employee></root>") }
+
+    it "keeps transform params intact when coercing one of them compacts" do
+      skip("GC compaction is unavailable") if skip_compaction_tests
+
+      compact = method(:gc_verify_compaction_references)
+      # A later coercion can move strings converted on earlier iterations.
+      trigger = Class.new do
+        define_method(:to_str) do
+          compact.call
+          "'triggered'"
+        end
+      end.new
+
+      stylesheet = Nokogiri::XSLT(<<~XSL)
+        <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+          <xsl:param name="title"/>
+          <xsl:param name="trigger"/>
+          <xsl:template match="/"><out><xsl:value-of select="$title"/></out></xsl:template>
+        </xsl:stylesheet>
+      XSL
+
+      result = stylesheet.transform(document, ["title", "'Employee List'", "trigger", trigger])
+
+      assert_equal("Employee List", result.at_xpath("//out").text)
+    end
+  end
 end
