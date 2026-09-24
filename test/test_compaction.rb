@@ -27,6 +27,22 @@ describe "compaction" do
     end
   end
 
+  describe Nokogiri::XML::Document do
+    it "retains inclusive namespaces while canonicalization callbacks compact" do
+      skip("GC compaction is unavailable") if skip_compaction_tests
+
+      namespace = Object.new
+      namespace.define_singleton_method(:to_str) { +"kept" }
+      doc = Nokogiri::XML('<doc xmlns:kept="urn:kept"><child/></doc>')
+      output = doc.canonicalize(Nokogiri::XML::XML_C14N_EXCLUSIVE_1_0, [namespace]) do
+        gc_verify_compaction_references
+        true
+      end
+
+      assert_equal('<doc xmlns:kept="urn:kept"><child></child></doc>', output)
+    end
+  end
+
   describe Nokogiri::XML::Namespace do
     it "namespace_scopes" do
       skip if skip_compaction_tests

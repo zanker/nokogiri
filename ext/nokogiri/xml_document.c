@@ -609,7 +609,9 @@ rb_xml_document_canonicalize(int argc, VALUE *argv, VALUE self)
   VALUE rb_namespaces;
   VALUE rb_comments_p;
   int c_mode = 0;
-  xmlChar **c_namespaces;
+  xmlChar **c_namespaces = NULL;
+  VALUE namespaces_handle = 0;
+  VALUE strings_handle = 0;
 
   xmlDocPtr c_doc;
   xmlOutputBufferPtr c_obuf;
@@ -633,6 +635,20 @@ rb_xml_document_canonicalize(int argc, VALUE *argv, VALUE self)
 
   c_doc = noko_xml_document_unwrap(self);
 
+  if (!NIL_P(rb_namespaces)) {
+    long ns_len = RARRAY_LEN(rb_namespaces);
+    c_namespaces = rb_alloc_tmp_buffer2(&namespaces_handle, ns_len + 1, sizeof(xmlChar *));
+    VALUE *strings = rb_alloc_tmp_buffer2(&strings_handle, ns_len, sizeof(VALUE));
+    memset(strings, 0, (size_t)ns_len * sizeof(VALUE));
+    for (long j = 0; j < ns_len; j++) {
+      VALUE entry = rb_ary_entry(rb_namespaces, j);
+      /* Temporary buffer roots pin the snapshots while coercions and callbacks run Ruby. */
+      strings[j] = rb_str_new_frozen(StringValue(entry));
+      c_namespaces[j] = (xmlChar *)StringValueCStr(strings[j]);
+    }
+    c_namespaces[ns_len] = NULL;
+  }
+
   rb_cStringIO = rb_const_get_at(rb_cObject, rb_intern("StringIO"));
   rb_io = rb_class_new_instance(0, 0, rb_cStringIO);
   c_obuf = xmlAllocOutputBuffer(NULL);
@@ -646,24 +662,14 @@ rb_xml_document_canonicalize(int argc, VALUE *argv, VALUE self)
     rb_callback = (void *)rb_block_proc();
   }
 
-  if (NIL_P(rb_namespaces)) {
-    c_namespaces = NULL;
-  } else {
-    long ns_len = RARRAY_LEN(rb_namespaces);
-    c_namespaces = ruby_xcalloc((size_t)ns_len + 1, sizeof(xmlChar *));
-    for (int j = 0 ; j < ns_len ; j++) {
-      VALUE entry = rb_ary_entry(rb_namespaces, j);
-      c_namespaces[j] = (xmlChar *)StringValueCStr(entry);
-    }
-  }
-
   int ret = xmlC14NExecute(c_doc, c_callback_wrapper, rb_callback,
                            c_mode,
                            c_namespaces,
                            (int)RTEST(rb_comments_p),
                            c_obuf);
 
-  ruby_xfree(c_namespaces);
+  ALLOCV_END(strings_handle);
+  ALLOCV_END(namespaces_handle);
   xmlOutputBufferClose(c_obuf);
 
   if (ret < 0) {
