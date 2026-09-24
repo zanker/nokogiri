@@ -32,6 +32,7 @@ Nokogiri follows [Semantic Versioning](https://semver.org/), please see the [REA
 * [CRuby] XSLT extension callbacks can safely retain nodes from the defensive document copy used when stripping wrapped whitespace nodes.
 * [CRuby] `XPathContext#evaluate` called from inside an XPath handler function no longer resets the outer evaluation's error handlers and function lookup.
 * [CRuby] XSLT extension instances stay alive and in place during compaction, and a nested transform no longer releases the outer transform's instances.
+* [CRuby] `NodeSet#push` and `NodeSet#dup` keep XPath namespace wrappers instead of storing copies that nothing owns.
 * [CRuby MacOS] Fixed an issue handling SIGINT during HTML5 parsing. (#3528, #3535) @stevecheckoway
 * [JRuby] Fixed multiple issues with `Node#namespace_definitions` so that it now behaves identically to CRuby. (#2543, #3460) @flavorjones
 * [JRuby] `Document#create_element` and `Node.new` no longer set the namespace to the document's default namespace. The namespace must be set explicitly with `namespace=` or by parenting the node. (#3457, #3463) @flavorjones
