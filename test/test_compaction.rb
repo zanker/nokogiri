@@ -76,6 +76,39 @@ describe "compaction" do
   describe Nokogiri::XSLT::Stylesheet do
     let(:document) { Nokogiri::XML("<root><employee>Jane</employee></root>") }
 
+    [false, true].each do |nested|
+      it "keeps extension instances alive during #{nested ? "nested" : "ordinary"} transforms" do
+        skip("GC compaction is unavailable") if skip_compaction_tests
+
+        compact = method(:gc_verify_compaction_references)
+        stylesheet = nil
+        compacting_extension = Class.new do
+          define_method(:run) do
+            stylesheet.transform(Nokogiri::XML("<nested/>")) if nested
+            compact.call
+            "compacted"
+          end
+        end
+        other_extension = Class.new do
+          def run
+            "alive"
+          end
+        end
+
+        stylesheet = Nokogiri::XSLT(<<~XSL, "urn:compacting" => compacting_extension, "urn:other" => other_extension)
+          <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                          xmlns:a="urn:compacting" xmlns:b="urn:other" extension-element-prefixes="a b">
+            <xsl:template match="root">
+              <out><xsl:value-of select="a:run()"/><xsl:value-of select="b:run()"/></out>
+            </xsl:template>
+            <xsl:template match="nested"><out>inner</out></xsl:template>
+          </xsl:stylesheet>
+        XSL
+
+        assert_equal("compactedalive", stylesheet.transform(document).root.text)
+      end
+    end
+
     it "keeps transform params intact when coercing one of them compacts" do
       skip("GC compaction is unavailable") if skip_compaction_tests
 

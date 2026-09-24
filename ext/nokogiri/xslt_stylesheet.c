@@ -7,6 +7,12 @@ mark(void *data)
 {
   nokogiriXsltStylesheetTuple *wrapper = (nokogiriXsltStylesheetTuple *)data;
   rb_gc_mark(wrapper->func_instances);
+  if (RTEST(wrapper->func_instances)) {
+    /* libxslt retains each extension instance's address until the transform shuts down. */
+    for (long i = 0; i < RARRAY_LEN(wrapper->func_instances); i++) {
+      rb_gc_mark(rb_ary_entry(wrapper->func_instances, i));
+    }
+  }
 }
 
 static void
@@ -437,7 +443,13 @@ shutdownFunc(xsltTransformContextPtr ctxt,
     wrapper
   );
 
-  rb_ary_clear(wrapper->func_instances);
+  /* A nested transform shuts down only its own instances. */
+  for (long i = 0; i < RARRAY_LEN(wrapper->func_instances); i++) {
+    if (rb_ary_entry(wrapper->func_instances, i) == (VALUE)data) {
+      rb_ary_delete_at(wrapper->func_instances, i);
+      break;
+    }
+  }
 }
 
 /* docstring is in lib/nokogiri/xslt.rb */
