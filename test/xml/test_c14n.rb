@@ -39,6 +39,15 @@ module Nokogiri
         assert_includes(doc.canonicalize(XML_C14N_EXCLUSIVE_1_0, [prefix, trigger]), 'xmlns:kept="urn:kept"')
       end
 
+      def test_block_exception_and_throw_release_native_context
+        doc = Nokogiri.XML("<doc><child/></doc>")
+        error = RuntimeError.new("expected")
+
+        assert_same(error, assert_raises(RuntimeError) { doc.canonicalize { raise error } })
+        assert_equal(:done, catch(:stop) { doc.canonicalize { throw(:stop, :done) } })
+        assert_equal("<doc><child></child></doc>", doc.canonicalize)
+      end
+
       # http://www.w3.org/TR/xml-c14n#Example-OutsideDoc
       def test_3_1
         doc = Nokogiri.XML(<<~eoxml)

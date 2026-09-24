@@ -572,13 +572,29 @@ noko_xml_document__create_entity(int argc, VALUE *argv, VALUE rb_document)
   return noko_xml_node_wrap(cNokogiriXmlEntityDecl, (xmlNodePtr)c_entity);
 }
 
+typedef struct {
+  VALUE block;
+  VALUE io;
+  int state;
+  xmlNodePtr node;
+  xmlNodePtr parent;
+} canonicalize_block_args;
+
 static int
-block_caller(void *ctx, xmlNodePtr c_node, xmlNodePtr c_parent_node)
+_noko_xml_document_canonicalize_write(void *ctx, const char *buffer, int len)
 {
-  VALUE block = (VALUE)ctx;
+  canonicalize_block_args *args = ctx;
+  return args->state ? len : noko_io_write((void *)args->io, (char *)buffer, len);
+}
+
+static VALUE
+_noko_xml_document_canonicalize_block_call(VALUE data)
+{
+  canonicalize_block_args *args = (canonicalize_block_args *)data;
+  xmlNodePtr c_node = args->node;
+  xmlNodePtr c_parent_node = args->parent;
   VALUE rb_node;
   VALUE rb_parent_node;
-  VALUE ret;
 
   if (c_node->type == XML_NAMESPACE_DECL) {
     rb_node = noko_xml_namespace_wrap((xmlNsPtr)c_node, c_parent_node->doc);
@@ -587,9 +603,21 @@ block_caller(void *ctx, xmlNodePtr c_node, xmlNodePtr c_parent_node)
   }
   rb_parent_node = c_parent_node ? noko_xml_node_wrap(Qnil, c_parent_node) : Qnil;
 
-  ret = rb_funcall(block, rb_intern("call"), 2, rb_node, rb_parent_node);
+  return rb_funcall(args->block, rb_intern("call"), 2, rb_node, rb_parent_node);
+}
 
-  return (Qfalse == ret || Qnil == ret) ? 0 : 1;
+/* A raise or throw from the block is held until libxml2 has released its canonicalization state. */
+static int
+block_caller(void *ctx, xmlNodePtr c_node, xmlNodePtr c_parent_node)
+{
+  canonicalize_block_args *args = ctx;
+  if (args->state) {
+    return 0;
+  }
+  args->node = c_node;
+  args->parent = c_parent_node;
+  VALUE result = rb_protect(_noko_xml_document_canonicalize_block_call, (VALUE)args, &args->state);
+  return RTEST(result);
 }
 
 /* call-seq:
@@ -616,7 +644,10 @@ rb_xml_document_canonicalize(int argc, VALUE *argv, VALUE self)
   xmlDocPtr c_doc;
   xmlOutputBufferPtr c_obuf;
   xmlC14NIsVisibleCallback c_callback_wrapper = NULL;
-  void *rb_callback = NULL;
+  canonicalize_block_args block_args = {
+    .block = Qnil,
+    .io = Qnil,
+  };
 
   VALUE rb_cStringIO;
   VALUE rb_io;
@@ -651,18 +682,19 @@ rb_xml_document_canonicalize(int argc, VALUE *argv, VALUE self)
 
   rb_cStringIO = rb_const_get_at(rb_cObject, rb_intern("StringIO"));
   rb_io = rb_class_new_instance(0, 0, rb_cStringIO);
+  block_args.io = rb_io;
   c_obuf = xmlAllocOutputBuffer(NULL);
 
-  c_obuf->writecallback = (xmlOutputWriteCallback)noko_io_write;
+  c_obuf->writecallback = _noko_xml_document_canonicalize_write;
   c_obuf->closecallback = (xmlOutputCloseCallback)noko_io_close;
-  c_obuf->context = (void *)rb_io;
+  c_obuf->context = &block_args;
 
   if (rb_block_given_p()) {
     c_callback_wrapper = block_caller;
-    rb_callback = (void *)rb_block_proc();
+    block_args.block = rb_block_proc();
   }
 
-  int ret = xmlC14NExecute(c_doc, c_callback_wrapper, rb_callback,
+  int ret = xmlC14NExecute(c_doc, c_callback_wrapper, &block_args,
                            c_mode,
                            c_namespaces,
                            (int)RTEST(rb_comments_p),
@@ -671,6 +703,11 @@ rb_xml_document_canonicalize(int argc, VALUE *argv, VALUE self)
   ALLOCV_END(strings_handle);
   ALLOCV_END(namespaces_handle);
   xmlOutputBufferClose(c_obuf);
+  RB_GC_GUARD(self);
+  RB_GC_GUARD(block_args.block);
+  if (block_args.state) {
+    rb_jump_tag(block_args.state);
+  }
 
   if (ret < 0) {
     rb_raise(rb_eRuntimeError, "canonicalization failed");
