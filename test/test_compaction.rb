@@ -72,4 +72,34 @@ describe "compaction" do
       end
     end
   end
+
+  describe Nokogiri::XSLT::Stylesheet do
+    let(:document) { Nokogiri::XML("<root><employee>Jane</employee></root>") }
+
+    it "transforms after compaction" do
+      skip("GC compaction is unavailable") if skip_compaction_tests
+
+      Nokogiri::XSLT.register("http://nokogiri.org/test/compaction", Class.new do
+        def shout(nodes)
+          nodes.first.content.upcase
+        end
+      end)
+
+      stylesheet_source = <<~XSL
+        <xsl:stylesheet version="1.0"
+                        xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                        xmlns:ex="http://nokogiri.org/test/compaction"
+                        extension-element-prefixes="ex">
+          <xsl:template match="/"><out><xsl:value-of select="ex:shout(//employee)"/></out></xsl:template>
+        </xsl:stylesheet>
+      XSL
+
+      # Hold the stylesheet off the machine stack so its wrapper can move.
+      held = [-> { Nokogiri::XSLT(stylesheet_source) }.call]
+
+      gc_verify_compaction_references
+
+      assert_equal("JANE", held.first.transform(document).at_xpath("//out").text)
+    end
+  end
 end
