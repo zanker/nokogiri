@@ -170,6 +170,17 @@ _noko_xslt_stylesheet_free_params(const char **params, long param_len)
   ruby_xfree(params);
 }
 
+static VALUE
+_noko_xslt_stylesheet_copy_document(VALUE rb_document)
+{
+  xmlDocPtr copy = xmlCopyDoc(noko_xml_document_unwrap(rb_document), 1);
+  RB_GC_GUARD(rb_document);
+  if (!copy) {
+    rb_memerror();
+  }
+  return noko_xml_document_wrap(0, copy);
+}
+
 /*
  * call-seq:
  *   transform(document)
@@ -293,7 +304,6 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
   const char **params ;
   long param_len ;
   int parse_error_occurred ;
-  int defensive_copy_p = 0;
 
   rb_scan_args(argc, argv, "11", &rb_document, &rb_param);
   if (NIL_P(rb_param)) { rb_param = rb_ary_new2(0L) ; }
@@ -312,6 +322,17 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
   c_document = noko_xml_document_unwrap(rb_document);
   TypedData_Get_Struct(self, nokogiriXsltStylesheetTuple, &nokogiri_xslt_stylesheet_tuple_type, wrapper);
 
+  xsltTransformContextPtr c_transform_context = xsltNewTransformContext(wrapper->ss, c_document);
+  int copy_document_p = xsltNeedElemSpaceHandling(c_transform_context) &&
+                        noko_xml_document_has_wrapped_blank_nodes_p(c_document);
+  xsltFreeTransformContext(c_transform_context);
+  if (copy_document_p) {
+    // see https://github.com/sparklemotion/nokogiri/issues/2800
+    /* Extension callbacks may retain nodes from the copy after the transform finishes. */
+    rb_document = _noko_xslt_stylesheet_copy_document(rb_document);
+    c_document = noko_xml_document_unwrap(rb_document);
+  }
+
   param_len = RARRAY_LEN(rb_param);
   params = ruby_xcalloc((size_t)param_len + 1, sizeof(char *));
   {
@@ -328,15 +349,6 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
   }
   params[param_len] = 0 ;
 
-  xsltTransformContextPtr c_transform_context = xsltNewTransformContext(wrapper->ss, c_document);
-  if (xsltNeedElemSpaceHandling(c_transform_context) &&
-      noko_xml_document_has_wrapped_blank_nodes_p(c_document)) {
-    // see https://github.com/sparklemotion/nokogiri/issues/2800
-    c_document = xmlCopyDoc(c_document, 1);
-    defensive_copy_p = 1;
-  }
-  xsltFreeTransformContext(c_transform_context);
-
   rb_error_str = rb_str_new(0, 0);
   xsltSetGenericErrorFunc((void *)rb_error_str, xslt_generic_error_handler);
   xmlSetGenericErrorFunc((void *)rb_error_str, xslt_generic_error_handler);
@@ -344,10 +356,7 @@ rb_xslt_stylesheet_transform(int argc, VALUE *argv, VALUE self)
   c_result_document = xsltApplyStylesheet(wrapper->ss, c_document, params);
 
   _noko_xslt_stylesheet_free_params(params, param_len);
-  if (defensive_copy_p) {
-    xmlFreeDoc(c_document);
-    c_document = NULL;
-  }
+  RB_GC_GUARD(rb_document);
 
   xsltSetGenericErrorFunc(NULL, NULL);
   xmlSetGenericErrorFunc(NULL, NULL);

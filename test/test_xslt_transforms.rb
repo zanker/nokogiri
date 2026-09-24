@@ -365,6 +365,35 @@ module Nokogiri
       end
 
       describe "https://github.com/sparklemotion/nokogiri/issues/2800" do
+        it "keeps copied nodes retained by extension callbacks alive" do
+          skip_unless_libxml2("Ruby extensions are only supported by libxslt")
+
+          retained = nil
+          extension = Class.new do
+            define_method(:retain) do |nodes|
+              retained = nodes.first
+              nodes
+            end
+          end
+          style = Nokogiri::XSLT(<<~XML, "urn:retain-copy" => extension)
+            <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                            xmlns:ext="urn:retain-copy" extension-element-prefixes="ext">
+              <xsl:strip-space elements="*"/>
+              <xsl:template match="doc"><out><xsl:value-of select="name(ext:retain(.))"/></out></xsl:template>
+            </xsl:stylesheet>
+          XML
+          document = Nokogiri::XML("<doc> <child/> </doc>")
+          blank = document.root.children.first
+
+          assert_equal("doc", style.transform(document).root.content)
+          refute_same(document, retained.document)
+          GC.start
+          gc_verify_compaction_references if GC.respond_to?(:verify_compaction_references)
+
+          assert_equal("child", retained.children.first.name)
+          assert_equal(" ", blank.content)
+        end
+
         let(:doc) do
           Nokogiri::XML::Document.parse(<<~XML)
             <catalog>
