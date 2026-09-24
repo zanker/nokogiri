@@ -30,6 +30,7 @@ Nokogiri follows [Semantic Versioning](https://semver.org/), please see the [REA
 * [CRuby] `Reader.outer_xml` and `.inner_xml` properly capture syntax errors. (#3558) @flavorjones
 * [CRuby] `XSLT::Stylesheet#transform` no longer corrupts its params when coercing one of them allocates. (#3670)
 * [CRuby] XSLT extension callbacks can safely retain nodes from the defensive document copy used when stripping wrapped whitespace nodes.
+* [CRuby] `XPathContext#evaluate` called from inside an XPath handler function no longer resets the outer evaluation's error handlers and function lookup.
 * [CRuby MacOS] Fixed an issue handling SIGINT during HTML5 parsing. (#3528, #3535) @stevecheckoway
 * [JRuby] Fixed multiple issues with `Node#namespace_definitions` so that it now behaves identically to CRuby. (#2543, #3460) @flavorjones
 * [JRuby] `Document#create_element` and `Node.new` no longer set the namespace to the document's default namespace. The namespace must be set explicitly with `namespace=` or by parenting the node. (#3457, #3463) @flavorjones

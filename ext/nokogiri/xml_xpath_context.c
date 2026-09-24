@@ -376,12 +376,20 @@ noko_xml_xpath_context_evaluate(int argc, VALUE *argv, VALUE rb_context)
   VALUE rb_errors = rb_ary_new();
   xmlXPathObjectPtr c_xpath_object;
   VALUE rb_xpath_object = Qnil;
+  libxmlStructuredErrorHandlerState handler_state;
+  xmlGenericErrorFunc previous_generic_handler = xmlGenericError;
+  void *previous_generic_context = xmlGenericErrorContext;
 
   TypedData_Get_Struct(rb_context, xmlXPathContext, &_noko_xml_xpath_context_type, c_context);
 
   rb_scan_args(argc, argv, "11", &rb_expression, &rb_function_lookup_handler);
 
   c_expression_str = (xmlChar *)StringValueCStr(rb_expression);
+
+  /* A handler function can evaluate another expression, which must not clobber this one's state. */
+  xmlXPathFuncLookupFunc previous_lookup = c_context->funcLookupFunc;
+  void *previous_lookup_data = c_context->funcLookupData;
+  void *previous_user_data = c_context->userData;
 
   if (Qnil != rb_function_lookup_handler) {
     /* FIXME: not sure if this is the correct place to shove private data. */
@@ -394,15 +402,16 @@ noko_xml_xpath_context_evaluate(int argc, VALUE *argv, VALUE rb_context)
   }
 
   /* TODO: use xmlXPathSetErrorHandler (as of 2.13.0) */
-  xmlSetStructuredErrorFunc((void *)rb_errors, noko__error_array_pusher);
+  noko__structured_error_func_save_and_set(&handler_state, (void *)rb_errors, noko__error_array_pusher);
   xmlSetGenericErrorFunc((void *)rb_errors, _noko_xml_xpath_context__generic_exception_pusher);
 
   c_xpath_object = xmlXPathEvalExpression(c_expression_str, c_context);
 
-  xmlSetStructuredErrorFunc(NULL, NULL);
-  xmlSetGenericErrorFunc(NULL, NULL);
+  noko__structured_error_func_restore(&handler_state);
+  xmlSetGenericErrorFunc(previous_generic_context, previous_generic_handler);
 
-  xmlXPathRegisterFuncLookup(c_context, NULL, NULL);
+  xmlXPathRegisterFuncLookup(c_context, previous_lookup, previous_lookup_data);
+  c_context->userData = previous_user_data;
 
   if (c_xpath_object == NULL) {
     rb_exc_raise(rb_ary_entry(rb_errors, 0));

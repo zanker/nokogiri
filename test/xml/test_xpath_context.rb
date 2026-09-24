@@ -32,6 +32,22 @@ module Nokogiri
         end
       end
 
+      it "restores error handlers and function lookup after nested evaluation" do
+        context = XPathContext.new(Document.parse("<root><child/></root>").root)
+        handler = Object.new
+        handler.define_singleton_method(:nested) do
+          context.evaluate("count(child)")
+          "inner"
+        end
+        handler.define_singleton_method(:tail) { "outer" }
+
+        assert_equal("innerouter", context.evaluate("concat(nokogiri:nested(), nokogiri:tail())", handler))
+        assert_raises(XPath::SyntaxError) do
+          context.evaluate("concat(nokogiri:nested(), missing:function())", handler)
+        end
+        assert_in_delta(1.0, context.evaluate("count(child)"))
+      end
+
       it "can register and deregister variables" do
         doc = Nokogiri::XML.parse(File.read(TestBase::XML_FILE), TestBase::XML_FILE)
 
