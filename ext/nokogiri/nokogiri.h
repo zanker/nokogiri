@@ -245,6 +245,6 @@ VALUE noko_xml_syntax_error__wrap(xmlErrorConstPtr error);
 void noko__error_array_pusher(void *ctx, xmlErrorConstPtr error);
 NORETURN_DECL void noko__error_raise(void *ctx, xmlErrorConstPtr error);
 void Nokogiri_marshal_xpath_funcall_and_return_values(xmlXPathParserContextPtr ctx, int nargs, VALUE handler,
-    const char *function_name) ;
+    const char *function_name, VALUE retained_nodes) ;
 
 #endif /* NOKOGIRI_NATIVE */

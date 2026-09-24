@@ -1,10 +1,92 @@
 # frozen_string_literal: true
 
 require "helper"
+require "weakref"
 
 describe "compaction" do
   def skip_compaction_tests
     !GC.respond_to?(:verify_compaction_references)
+  end
+
+  [:nodes, :namespaces].product([false, true], [false, true]).each do |result_type, return_array, clear_result|
+    describe "callback #{result_type} as #{return_array ? "arrays" : "node sets"} (cleared: #{clear_result})" do
+      # A callback turns GC stress on, so make sure a failed evaluation doesn't leave it on.
+      after { GC.stress = false }
+
+      let(:function_class) do
+        compact = method(:gc_verify_compaction_references)
+        selector = (result_type == :namespaces) ? "/other/namespace::*" : "/other/child"
+        Class.new do
+          define_method(:fresh) do
+            document = Nokogiri::XML('<other xmlns:kept="urn:kept"><child>retained</child></other>')
+            @document = WeakRef.new(document)
+            nodes = document.xpath(selector)
+            if clear_result && !return_array
+              nodes = Nokogiri::XML::NodeSet.new(Nokogiri::XML("<owner/>"), nodes.to_a)
+            end
+            result = return_array ? nodes.to_a : nodes
+            @result = result if clear_result
+            # Collect on every allocation while libxml2 takes over the result, until the next callback.
+            GC.stress = true
+            result
+          end
+
+          def empty
+            GC.stress = false
+            Nokogiri::XML("<empty/>").xpath("missing")
+          end
+
+          def clear
+            until @result.empty?
+              @result.pop
+            end
+            empty
+          end
+
+          define_method(:verify) do
+            compact.call
+            raise "callback result document was collected" if !@document.weakref_alive?
+
+            true
+          end
+        end
+      end
+
+      it "keeps returned XPath nodes alive until evaluation finishes" do
+        skip("GC compaction is unavailable") if skip_compaction_tests
+
+        handler = function_class.new
+        document = Nokogiri::XML("<root/>")
+        next_function = clear_result ? "clear" : "empty"
+        expression = "(nokogiri:fresh() | nokogiri:#{next_function}() | nokogiri:empty())[nokogiri:verify()]"
+        expression += "/parent::node()" if result_type == :namespaces
+
+        result = document.xpath(expression, handler)
+        assert_equal([(result_type == :namespaces) ? "other" : "child"], result.map(&:name))
+        assert_equal("retained", result.text)
+      end
+
+      it "keeps returned XSLT nodes alive until the transform finishes" do
+        skip("GC compaction is unavailable") if skip_compaction_tests
+
+        next_function = clear_result ? "clear" : "empty"
+        expression = "(ext:fresh() | ext:#{next_function}() | ext:empty())[ext:verify()]"
+        expression += "/parent::node()" if result_type == :namespaces
+        stylesheet = Nokogiri::XSLT(<<~XML, "urn:retained-results" => function_class)
+          <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                          xmlns:ext="urn:retained-results" extension-element-prefixes="ext">
+            <xsl:template match="/">
+              <out><xsl:copy-of select="#{expression}"/></out>
+            </xsl:template>
+          </xsl:stylesheet>
+        XML
+        document = Nokogiri::XML("<root/>")
+
+        result = stylesheet.transform(document)
+        assert_equal([(result_type == :namespaces) ? "other" : "child"], result.root.element_children.map(&:name))
+        assert_equal("retained", result.root.content)
+      end
+    end
   end
 
   describe Nokogiri::XML::Node do

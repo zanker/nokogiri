@@ -8,7 +8,7 @@ mark(void *data)
   nokogiriXsltStylesheetTuple *wrapper = (nokogiriXsltStylesheetTuple *)data;
   rb_gc_mark(wrapper->func_instances);
   if (RTEST(wrapper->func_instances)) {
-    /* libxslt retains each extension instance's address until the transform shuts down. */
+    /* libxslt retains each module's data array until the transform shuts down. */
     for (long i = 0; i < RARRAY_LEN(wrapper->func_instances); i++) {
       rb_gc_mark(rb_ary_entry(wrapper->func_instances, i));
     }
@@ -386,14 +386,17 @@ method_caller(xmlXPathParserContextPtr ctxt, int nargs)
 
   transform = xsltXPathGetTransformContext(ctxt);
   functionURI = ctxt->context->functionURI;
-  handler = (VALUE)xsltGetExtData(transform, functionURI);
+  /* module data is [extension instance, nodes returned during this transform] */
+  VALUE module_data = (VALUE)xsltGetExtData(transform, functionURI);
+  handler = rb_ary_entry(module_data, 0);
   function_name = (const char *)(ctxt->context->function);
 
   Nokogiri_marshal_xpath_funcall_and_return_values(
     ctxt,
     nargs,
     handler,
-    (const char *)function_name
+    (const char *)function_name,
+    rb_ary_entry(module_data, 1)
   );
 }
 
@@ -425,9 +428,10 @@ initFunc(xsltTransformContextPtr ctxt, const xmlChar *uri)
     wrapper
   );
   inst = rb_class_new_instance(0, NULL, obj);
-  rb_ary_push(wrapper->func_instances, inst);
+  VALUE module_data = rb_ary_new_from_args(2, inst, rb_ary_new());
+  rb_ary_push(wrapper->func_instances, module_data);
 
-  return (void *)inst;
+  return (void *)module_data;
 }
 
 static void
